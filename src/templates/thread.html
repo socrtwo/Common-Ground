@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% from "_macros.html" import render_post with context %}
+{% block title %}{% if t.title_hidden %}[title removed]{% else %}{{ t.title }}{% endif %} — Common Ground{% endblock %}
+{% block content %}
+<h1>{% if t.title_hidden %}<span class="removed">[title removed by moderator — see mod log]</span>{% else %}{{ t.title }}{% endif %}</h1>
+{% for p in posts %}{{ render_post(p) }}{% endfor %}
+<a id="end"></a>
+{% if user %}
+<form method="post">{{ csrf_field }}
+  <textarea name="body" rows="4" maxlength="{{ config.MAX_BODY_LEN }}" aria-label="Reply" required>{{ draft }}</textarea>
+  <button>Reply</button>
+</form>
+{% else %}
+<p class="meta">Join or log in to reply.</p>
+{% endif %}
+{% endblock %}

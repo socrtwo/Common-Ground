@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% from "_macros.html" import render_post, rule_select with context %}
+{% block content %}
+<h1>Moderate post #{{ p.id }}</h1>
+<p class="meta">Thread: <a href="{{ url_for('forum.thread', tid=p.thread_id) }}#p{{ p.id }}">{% if p.title_hidden %}[title removed]{% else %}{{ p.title }}{% endif %}</a>
+· {{ p.n_reports }} open report{{ '' if p.n_reports == 1 else 's' }}{% if muted %} · author muted until {{ p.muted_until|ts }}{% endif %}</p>
+{{ render_post(p, show_removed=true) }}
+
+{% set here = url_for('forum.admin_post', pid=p.id) %}
+{% if not p.hidden %}
+<form class="action" method="post" action="{{ here }}">{{ csrf_field }}
+  <input type="hidden" name="action" value="remove">
+  <p>Rule broken: {{ rule_select() }}</p>
+  <p>Mute author for <input class="days" type="number" name="mute_days" value="0" min="0" max="{{ max_mute }}" aria-label="Mute days"> days (0 = no mute)</p>
+  <button>Remove post</button>
+</form>
+{% else %}
+<form class="action" method="post" action="{{ here }}">{{ csrf_field }}
+  <input type="hidden" name="action" value="restore"><button>Restore post</button>
+</form>
+{% endif %}
+
+{% if p.n_reports and not p.hidden %}
+<form class="action" method="post" action="{{ here }}">{{ csrf_field }}
+  <input type="hidden" name="action" value="dismiss"><button>Dismiss reports (no violation)</button>
+</form>
+{% endif %}
+
+{% if p.is_opener %}
+  {% if p.title_hidden %}
+<form class="action" method="post" action="{{ here }}">{{ csrf_field }}
+  <input type="hidden" name="action" value="restore_title"><button>Restore thread title</button>
+</form>
+  {% else %}
+<form class="action" method="post" action="{{ here }}">{{ csrf_field }}
+  <input type="hidden" name="action" value="hide_title">
+  <p>Thread title breaks: {{ rule_select() }}</p>
+  <button>Remove thread title</button>
+</form>
+  {% endif %}
+{% endif %}
+
+{% if muted %}
+<form class="action" method="post" action="{{ here }}">{{ csrf_field }}
+  <input type="hidden" name="action" value="unmute"><button>Lift author's mute</button>
+</form>
+{% endif %}
+<p><a href="{{ url_for('forum.admin') }}">Back to report queue</a></p>
+{% endblock %}

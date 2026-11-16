@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge, pager with context %}
+{% block content %}
+{% if user %}
+<h2>Start a conversation</h2>
+<form method="post" action="{{ url_for('forum.new_thread') }}">{{ csrf_field }}
+  <input type="text" name="title" maxlength="{{ config.MAX_TITLE_LEN }}" placeholder="Question or topic" aria-label="Title" value="{{ draft_title }}" required>
+  <textarea name="body" rows="4" maxlength="{{ config.MAX_BODY_LEN }}" placeholder="Say more" aria-label="Text" required>{{ draft_body }}</textarea>
+  <button>Post</button>
+</form>
+{% endif %}
+<h2>Conversations</h2>
+{% for t in threads %}
+<div class="post">
+  <a href="{{ url_for('forum.thread', tid=t.id) }}"><b>{% if t.title_hidden %}[title removed by moderator]{% else %}{{ t.title }}{% endif %}</b></a>
+  <div class="meta">{{ t.handle }}{{ badge(t.agent) }} · {{ t.n }} post{{ '' if t.n == 1 else 's' }}{% if t.has_agent %} · agent participating{% endif %}</div>
+</div>
+{% else %}
+<p>No conversations yet.</p>
+{% endfor %}
+{{ pager('forum.index', page, has_next) }}
+{% endblock %}

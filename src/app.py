@@ -1,273 +1,685 @@
 """
 Common Ground - anonymous dialogue between verified ICE employees and the public.
 
-Run:   ADMIN_KEY=change-me python3 app.py      ->  http://127.0.0.1:5000
+Run:   ADMIN_KEY=<16+ chars> python3 app.py      ->  http://127.0.0.1:5000
+WSGI:  gunicorn 'app:create_app()'
+
 - No email, phone, or IP is stored. Accounts are a random handle + secret key.
 - Agents get a "Verified ICE employee" badge by redeeming a blind-signed token
   (see blindtoken.py); the server cannot tell which employee it came from.
-- Admins hide posts and mute accounts; every action goes to a public log.
+- Admins remove posts and mute accounts; every action goes to a public log.
 """
-import hashlib, json, logging, os, secrets, sqlite3, time
-from flask import Flask, request, redirect, g, abort, make_response, render_template_string
-from blindtoken import Verifier
+from __future__ import annotations
 
-DB = os.environ.get("CG_DB", "commonground.db")
-KEYRING = os.environ.get("CG_KEYRING", "keyring.json")
-ADMIN_KEY = os.environ.get("ADMIN_KEY")
-POST_INTERVAL = 30            # seconds between posts per account
-MAX_LEN = 4000
+import hashlib
+import hmac
+import json
+import logging
+import os
+import secrets
+import sqlite3
+import time
 
-app = Flask(__name__)
-logging.getLogger("werkzeug").setLevel(logging.ERROR)   # werkzeug logs IPs; silence it
+from flask import (
+    Blueprint,
+    Flask,
+    abort,
+    current_app,
+    g,
+    redirect,
+    render_template,
+    request,
+    url_for,
+)
+from markupsafe import Markup
 
+from blindtoken import Verifier, key_is_active, load_keyring
+
+SCHEMA_VERSION = 2
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, handle TEXT UNIQUE,
-  secret_hash TEXT UNIQUE, agent INT DEFAULT 0, muted_until INT DEFAULT 0,
-  last_post INT DEFAULT 0, created INT);
-CREATE TABLE IF NOT EXISTS threads(id INTEGER PRIMARY KEY, title TEXT,
-  user_id INT, created INT, hidden INT DEFAULT 0);
-CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY, thread_id INT,
-  user_id INT, body TEXT, created INT, hidden INT DEFAULT 0);
-CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY, post_id INT,
-  reason TEXT, created INT, resolved INT DEFAULT 0);
-CREATE TABLE IF NOT EXISTS modlog(id INTEGER PRIMARY KEY, action TEXT,
-  target TEXT, reason TEXT, created INT);
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY,
+  handle TEXT NOT NULL UNIQUE,
+  secret_hash TEXT NOT NULL UNIQUE,
+  agent_epoch TEXT,                         -- epoch of the redeemed credential
+  muted_until INTEGER NOT NULL DEFAULT 0,
+  last_post INTEGER NOT NULL DEFAULT 0,
+  last_report INTEGER NOT NULL DEFAULT 0,
+  created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS threads(
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  agent INTEGER NOT NULL DEFAULT 0,         -- author's badge was valid when posted
+  created INTEGER NOT NULL,
+  bumped INTEGER NOT NULL,                  -- time of the latest post
+  title_hidden INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS posts(
+  id INTEGER PRIMARY KEY,
+  thread_id INTEGER NOT NULL REFERENCES threads(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  body TEXT NOT NULL,
+  agent INTEGER NOT NULL DEFAULT 0,         -- author's badge was valid when posted
+  created INTEGER NOT NULL,
+  hidden INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS reports(
+  id INTEGER PRIMARY KEY,
+  post_id INTEGER NOT NULL REFERENCES posts(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  rule INTEGER NOT NULL,
+  created INTEGER NOT NULL,
+  resolved INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(post_id, user_id));
+CREATE TABLE IF NOT EXISTS modlog(
+  id INTEGER PRIMARY KEY,
+  action TEXT NOT NULL,
+  target TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS users_created ON users(created);
+CREATE INDEX IF NOT EXISTS threads_bumped ON threads(bumped);
+CREATE INDEX IF NOT EXISTS posts_thread ON posts(thread_id, id);
+CREATE INDEX IF NOT EXISTS reports_open ON reports(resolved, post_id);
 """
 
+# (short label, full text). Keep the full text in sync with docs/MODERATION.md.
 RULES = [
-    "No doxxing: never post names, photos, addresses, or identifying details of anyone.",
-    "No operational information: no planned actions, locations, or case specifics.",
-    "No threats, harassment, or slurs.",
-    "Argue with ideas, not people. Good-faith disagreement is welcome.",
-    "Do not claim to be an agent without the verified badge.",
+    ("No doxxing",
+     "No doxxing: never post names, photos, addresses, or identifying details of anyone."),
+    ("No operational information",
+     "No operational information: no planned actions, locations, or case specifics."),
+    ("No threats, harassment, or slurs",
+     "No threats, harassment, or slurs."),
+    ("Argue with ideas, not people",
+     "Argue with ideas, not people. Good-faith disagreement is welcome."),
+    ("No false agent claims",
+     "Do not claim to be an agent without the verified badge."),
 ]
 
-ADJ = "quiet steady candid patient frank open plain level civil honest".split()
-NOUN = "river cedar harbor bridge lantern meadow compass anchor ridge prairie".split()
+ADJECTIVES = ("quiet steady candid patient frank open plain level civil honest calm "
+              "earnest fair gentle humble mindful sincere thoughtful careful direct "
+              "curious mellow sturdy modest").split()
+NOUNS = ("river cedar harbor bridge lantern meadow compass anchor ridge prairie "
+         "orchard canyon beacon willow summit hollow garden trail delta grove "
+         "mesa harvest ember tide").split()
 
-# ------------------------------------------------------------------ helpers
-def db():
+# Fixed notices selectable with ?m=<code>; never reflect free text from the URL.
+NOTICES = {
+    "reported": "Reported. A moderator will review it.",
+    "report-wait": "Please wait a few seconds between reports.",
+    "report-gone": "That post is no longer available to report.",
+    "verified": "Badge added. It appears on posts you make from now on.",
+    "logged-out": "Logged out.",
+}
+
+DEFAULTS = {
+    "POST_INTERVAL": 30,          # seconds between posts per account
+    "REPORT_INTERVAL": 10,        # seconds between reports per account
+    "NEW_ACCOUNT_WAIT": 60,       # seconds before a new account may post
+    "MAX_JOINS_PER_HOUR": 120,    # site-wide cap on new accounts; 0 disables
+    "MAX_BODY_LEN": 4000,
+    "MAX_TITLE_LEN": 150,
+    "MAX_MUTE_DAYS": 365,
+    "PAGE_SIZE": 50,
+    "MIN_ADMIN_KEY_LEN": 16,
+    "MAX_CONTENT_LENGTH": 64 * 1024,
+}
+
+COOKIE_MAX_AGE = 3600 * 24 * 365
+CSP = ("default-src 'none'; style-src 'self'; form-action 'self'; "
+       "base-uri 'none'; frame-ancestors 'none'")
+
+bp = Blueprint("forum", __name__)
+
+
+# ------------------------------------------------------------------ database
+def init_db(path: str) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        populated = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
+        if populated and version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"{path} uses database schema {version}; this code needs "
+                f"{SCHEMA_VERSION}. Move the old file aside (or migrate it) and restart.")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(SCHEMA)
+        conn.execute(Verifier.SCHEMA)
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_db() -> sqlite3.Connection:
     if "db" not in g:
-        g.db = sqlite3.connect(DB); g.db.row_factory = sqlite3.Row
-        g.db.executescript(SCHEMA)
+        g.db = sqlite3.connect(current_app.config["DB"], timeout=10)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys=ON")
     return g.db
 
-@app.teardown_appcontext
-def _close(_):
-    d = g.pop("db", None)
-    if d: d.close()
 
-def h(s): return hashlib.sha256(s.encode()).hexdigest()
-def now(): return int(time.time())
+@bp.teardown_app_request
+def close_db(_exc):
+    conn = g.pop("db", None)
+    if conn is not None:
+        conn.close()
+
+
+# ------------------------------------------------------------------- helpers
+def now() -> int:
+    return int(time.time())
+
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def same(a: str, b: str) -> bool:
+    """Constant-time string comparison that tolerates non-ASCII input."""
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
+def fmt_time(t: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(t))
+
+
+def cfg(name: str):
+    return current_app.config[name]
+
 
 def current_user():
-    s = request.cookies.get("cg_secret")
-    return db().execute("SELECT * FROM users WHERE secret_hash=?", (h(s),)).fetchone() if s else None
+    if "user" not in g:
+        secret = request.cookies.get("cg_secret")
+        g.user = get_db().execute(
+            "SELECT * FROM users WHERE secret_hash=?", (sha256_hex(secret),)
+        ).fetchone() if secret else None
+    return g.user
 
-def is_admin():
-    return bool(ADMIN_KEY) and secrets.compare_digest(request.cookies.get("cg_admin", ""), ADMIN_KEY)
 
-def set_cookie(resp, k, v):
-    resp.set_cookie(k, v, max_age=3600*24*365, httponly=True, samesite="Strict")
+def keyring() -> dict:
+    """Pinned issuer keys, re-read per request so rotation needs no restart.
+    A malformed file fails closed: no key is trusted and badges lapse."""
+    if "keyring" not in g:
+        try:
+            g.keyring = load_keyring(cfg("KEYRING"))
+        except (ValueError, OSError) as ex:
+            current_app.logger.error("Ignoring unusable keyring %s: %s", cfg("KEYRING"), ex)
+            g.keyring = {}
+    return g.keyring
+
+
+def badge_active(user) -> bool:
+    """A badge lasts only as long as the epoch key it was redeemed under."""
+    if not user or not user["agent_epoch"]:
+        return False
+    pk = keyring().get(user["agent_epoch"])
+    return pk is not None and key_is_active(pk)
+
+
+def admin_token() -> str | None:
+    """Value of the admin session cookie, or None if admin access is off.
+    Derived from ADMIN_KEY so the key itself is never stored in a browser."""
+    key = cfg("ADMIN_KEY")
+    if not key or len(key) < cfg("MIN_ADMIN_KEY_LEN"):
+        return None
+    return hmac.new(key.encode(), b"common-ground/admin-session/v1", hashlib.sha256).hexdigest()
+
+
+def is_admin() -> bool:
+    if "admin" not in g:
+        token = admin_token()
+        g.admin = token is not None and same(request.cookies.get("cg_admin", ""), token)
+    return g.admin
+
+
+def require_admin() -> None:
+    if not is_admin():
+        abort(403)
+
+
+def set_cookie(resp, name: str, value: str, max_age: int | None = COOKIE_MAX_AGE):
+    resp.set_cookie(name, value, max_age=max_age, httponly=True, samesite="Strict",
+                    secure=cfg("COOKIE_SECURE"))
     return resp
 
-def verifier():
-    ring = json.load(open(KEYRING)) if os.path.exists(KEYRING) else {}
-    return Verifier(ring, db())
 
-def log_mod(action, target, reason):
-    db().execute("INSERT INTO modlog(action,target,reason,created) VALUES(?,?,?,?)",
-                 (action, target, reason, now())); db().commit()
+def clear_cookie(resp, name: str):
+    resp.delete_cookie(name, httponly=True, samesite="Strict", secure=cfg("COOKIE_SECURE"))
+    return resp
 
-def can_post(u):
-    if not u: return "Join first."
-    if u["muted_until"] > now(): return "This account is muted until " + time.strftime("%Y-%m-%d %H:%M", time.gmtime(u["muted_until"])) + " UTC."
-    if now() - u["last_post"] < POST_INTERVAL: return f"Please wait {POST_INTERVAL}s between posts."
+
+def rule_from_form() -> int | None:
+    """1-based rule number from the submitted form, or None if invalid."""
+    try:
+        rule = int(request.form.get("rule", ""))
+    except ValueError:
+        return None
+    return rule if 1 <= rule <= len(RULES) else None
+
+
+def rule_label(rule: int) -> str:
+    return f"Rule {rule}: {RULES[rule - 1][0]}"
+
+
+def log_mod(action: str, target: str, reason: str) -> None:
+    """Append to the public moderation log (caller commits)."""
+    get_db().execute("INSERT INTO modlog(action,target,reason,created) VALUES(?,?,?,?)",
+                     (action, target, reason, now()))
+
+
+def page_number() -> int:
+    try:
+        return max(1, min(int(request.args.get("page", "1")), 100000))
+    except ValueError:
+        return 1
+
+
+# ----------------------------------------------------------- request plumbing
+@bp.before_app_request
+def csrf_protect():
+    """Double-submit CSRF token. SameSite=Strict already keeps the account
+    cookie off cross-site POSTs; this also stops login CSRF, where a hostile
+    page signs the visitor into an account the attacker holds the key to."""
+    cookie = request.cookies.get("cg_csrf", "")
+    if request.method == "POST":
+        if not cookie or not same(cookie, request.form.get("csrf", "")):
+            abort(400, "This form has expired or cookies are disabled. "
+                       "Go back, reload the page and try again.")
+    g.csrf = cookie or secrets.token_urlsafe(24)
+
+
+@bp.after_app_request
+def finish_response(resp):
+    csrf = g.get("csrf")
+    if csrf and request.cookies.get("cg_csrf") != csrf:
+        set_cookie(resp, "cg_csrf", csrf)
+    resp.headers.setdefault("Content-Security-Policy", CSP)
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    if request.endpoint != "static":
+        # Pages can show a secret key or reflect the viewer's account.
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@bp.app_context_processor
+def template_context():
+    user = current_user()
+    return {
+        "user": user,
+        "user_is_agent": badge_active(user),
+        "admin": is_admin(),
+        "rules": RULES,
+        "notice": NOTICES.get(request.args.get("m", "")),
+        "csrf_field": Markup('<input type="hidden" name="csrf" value="{}">').format(
+            g.get("csrf", "")),
+    }
+
+
+# ------------------------------------------------------------------- posting
+def post_block(user) -> tuple[str, int] | None:
+    """Why this account may not post right now, as (message, HTTP status)."""
+    if not user:
+        return "Join or log in first.", 403
+    t = now()
+    if user["muted_until"] > t:
+        return f"This account is muted until {fmt_time(user['muted_until'])}.", 403
+    wait = user["created"] + cfg("NEW_ACCOUNT_WAIT") - t
+    if wait > 0:
+        return f"New accounts can post after {wait} more seconds.", 429
+    wait = user["last_post"] + cfg("POST_INTERVAL") - t
+    if wait > 0:
+        return f"Please wait {wait} more seconds between posts.", 429
     return None
 
-def add_post(u, thread_id, body):
-    db().execute("INSERT INTO posts(thread_id,user_id,body,created) VALUES(?,?,?,?)",
-                 (thread_id, u["id"], body[:MAX_LEN], now()))
-    db().execute("UPDATE users SET last_post=? WHERE id=?", (now(), u["id"])); db().commit()
 
-# ------------------------------------------------------------------ template
-BASE = """<!doctype html><html><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>Common Ground</title>
-<style>
-body{font:16px/1.5 system-ui,sans-serif;max-width:760px;margin:auto;padding:0 16px;color:#222;background:#fafafa}
-a{color:#1a5fb4} header{display:flex;gap:14px;align-items:center;flex-wrap:wrap;border-bottom:1px solid #ddd;padding:10px 0}
-header b{font-size:1.2em;margin-right:auto} .post{background:#fff;border:1px solid #e3e3e3;border-radius:6px;padding:10px 12px;margin:10px 0}
-.meta{font-size:.85em;color:#666} .agent{background:#1a5fb4;color:#fff;border-radius:4px;padding:1px 6px;font-size:.8em}
-.hidden{color:#999;font-style:italic} textarea,input[type=text]{width:100%;box-sizing:border-box;font:inherit;padding:6px}
-button{font:inherit;padding:4px 12px} .msg{background:#fff3cd;padding:8px;border-radius:4px} form.inline{display:inline}
-@media(prefers-color-scheme:dark){body{background:#151515;color:#ddd}.post{background:#1f1f1f;border-color:#333}a{color:#8ab4f8}.msg{background:#4a3f12}}
-</style></head><body><header><b><a href="/" style="text-decoration:none;color:inherit">Common Ground</a></b>
-<a href="/rules">Rules</a><a href="/modlog">Mod log</a>
-{% if user %}<span>{{user.handle}}{% if user.agent %} <span class=agent>Verified ICE employee</span>{% endif %}</span>
-{% if not user.agent %}<a href="/verify">Agent verification</a>{% endif %}
-{% else %}<form class=inline method=post action="/join"><button>Join anonymously</button></form><a href="/login">Log in</a>{% endif %}
-{% if admin %}<a href="/admin">Admin</a>{% endif %}</header>
-{% if msg %}<p class=msg>{{msg}}</p>{% endif %}{{ body|safe }}</body></html>"""
+def clean_body(raw: str) -> str:
+    # Browsers submit CRLF but count a line break as one character for
+    # maxlength, so normalise before measuring.
+    return raw.replace("\r\n", "\n").replace("\r", "\n").strip()
 
-def page(body_tpl, msg=None, **ctx):
-    u = current_user()
-    inner = render_template_string(body_tpl, user=u, admin=is_admin(), **ctx)
-    return render_template_string(BASE, body=inner, user=u, admin=is_admin(), msg=msg)
 
-POST_TPL = """<div class=post id=p{{p.id}}><div class=meta>{{p.handle}}
-{% if p.agent %}<span class=agent>Verified ICE employee</span>{% endif %}
-· {{ fmt(p.created) }}{% if user and not p.hidden %} · <form class=inline method=post action="/report/{{p.id}}">
-<input type=hidden name=reason value="rule violation"><button style="font-size:.8em">Report</button></form>{% endif %}
-{% if admin and not p.hidden %} · <a href="/admin/post/{{p.id}}">moderate</a>{% endif %}</div>
-{% if p.hidden %}<p class=hidden>[removed by moderator — see mod log]</p>{% else %}<p style="white-space:pre-wrap">{{p.body}}</p>{% endif %}</div>"""
+def body_error(body: str) -> str | None:
+    if not body:
+        return "Text is required."
+    if len(body) > cfg("MAX_BODY_LEN"):
+        return f"Posts are limited to {cfg('MAX_BODY_LEN')} characters."
+    return None
 
-def fmt(t): return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(t))
 
-# ------------------------------------------------------------------ routes
-@app.get("/")
+def claim_post_slot(user) -> bool:
+    """Atomically take this account's posting slot; False if a concurrent
+    request got there first. Leaves the transaction open for the caller."""
+    t = now()
+    cur = get_db().execute("UPDATE users SET last_post=? WHERE id=? AND last_post<=?",
+                           (t, user["id"], t - cfg("POST_INTERVAL")))
+    return cur.rowcount == 1
+
+
+def insert_post(user, thread_id: int, body: str) -> None:
+    t = now()
+    db = get_db()
+    db.execute("INSERT INTO posts(thread_id,user_id,body,agent,created) VALUES(?,?,?,?,?)",
+               (thread_id, user["id"], body, int(badge_active(user)), t))
+    db.execute("UPDATE threads SET bumped=? WHERE id=?", (t, thread_id))
+
+
+# -------------------------------------------------------------------- routes
+def render_index(msg=None, status=200, title="", body=""):
+    size, page = cfg("PAGE_SIZE"), page_number()
+    rows = get_db().execute(
+        """SELECT t.id, t.title, t.title_hidden, t.agent, u.handle,
+             (SELECT COUNT(*) FROM posts p WHERE p.thread_id=t.id AND p.hidden=0) AS n,
+             (SELECT MAX(p.agent) FROM posts p WHERE p.thread_id=t.id AND p.hidden=0) AS has_agent
+           FROM threads t JOIN users u ON u.id=t.user_id
+           ORDER BY t.bumped DESC, t.id DESC LIMIT ? OFFSET ?""",
+        (size + 1, (page - 1) * size)).fetchall()
+    return render_template("index.html", threads=rows[:size], page=page,
+                           has_next=len(rows) > size, msg=msg,
+                           draft_title=title, draft_body=body), status
+
+
+@bp.get("/")
 def index():
-    rows = db().execute("""SELECT t.*, u.handle, u.agent,
-        (SELECT COUNT(*) FROM posts p WHERE p.thread_id=t.id AND p.hidden=0) n,
-        (SELECT MAX(u2.agent) FROM posts p2 JOIN users u2 ON u2.id=p2.user_id
-           WHERE p2.thread_id=t.id AND p2.hidden=0) has_agent
-        FROM threads t JOIN users u ON u.id=t.user_id WHERE t.hidden=0
-        ORDER BY (SELECT MAX(created) FROM posts WHERE thread_id=t.id) DESC LIMIT 100""").fetchall()
-    return page("""{% if user %}<h3>Start a conversation</h3><form method=post action="/new">
-<input type=text name=title maxlength=150 placeholder="Question or topic" required>
-<textarea name=body rows=4 maxlength=4000 placeholder="Say more" required></textarea><button>Post</button></form>{% endif %}
-<h3>Conversations</h3>{% for t in rows %}<div class=post><a href="/t/{{t.id}}"><b>{{t.title}}</b></a>
-<div class=meta>{{t.handle}}{% if t.agent %} <span class=agent>Verified ICE employee</span>{% endif %}
-· {{t.n}} posts{% if t.has_agent %} · agent participating{% endif %}</div></div>
-{% else %}<p>No conversations yet.</p>{% endfor %}""", rows=rows)
+    return render_index()
 
-@app.post("/join")
+
+@bp.post("/new")
+def new_thread():
+    user = current_user()
+    title = " ".join(request.form.get("title", "").split())
+    body = clean_body(request.form.get("body", ""))
+    block = post_block(user)
+    if block:
+        return render_index(block[0], block[1], title, body)
+    err = body_error(body)
+    if not title:
+        err = "A title is required."
+    elif len(title) > cfg("MAX_TITLE_LEN"):
+        err = f"Titles are limited to {cfg('MAX_TITLE_LEN')} characters."
+    if err:
+        return render_index(err, 400, title, body)
+    db = get_db()
+    if not claim_post_slot(user):
+        db.rollback()
+        return render_index("Please wait between posts.", 429, title, body)
+    t = now()
+    cur = db.execute("INSERT INTO threads(title,user_id,agent,created,bumped) VALUES(?,?,?,?,?)",
+                     (title, user["id"], int(badge_active(user)), t, t))
+    insert_post(user, cur.lastrowid, body)
+    db.commit()
+    return redirect(url_for("forum.thread", tid=cur.lastrowid))
+
+
+@bp.route("/t/<int:tid>", methods=["GET", "POST"])
+def thread(tid):
+    db = get_db()
+    t = db.execute("SELECT * FROM threads WHERE id=?", (tid,)).fetchone()
+    if not t:
+        abort(404)
+    msg, status, draft = None, 200, ""
+    if request.method == "POST":
+        user = current_user()
+        draft = clean_body(request.form.get("body", ""))
+        block = post_block(user)
+        if block:
+            msg, status = block
+        elif body_error(draft):
+            msg, status = body_error(draft), 400
+        elif not claim_post_slot(user):
+            db.rollback()
+            msg, status = "Please wait between posts.", 429
+        else:
+            insert_post(user, tid, draft)
+            db.commit()
+            return redirect(url_for("forum.thread", tid=tid) + "#end")
+    posts = db.execute(
+        """SELECT p.*, u.handle FROM posts p JOIN users u ON u.id=p.user_id
+           WHERE p.thread_id=? ORDER BY p.id""", (tid,)).fetchall()
+    return render_template("thread.html", t=t, posts=posts, msg=msg, draft=draft), status
+
+
+@bp.post("/join")
 def join():
+    if current_user():
+        return redirect(url_for("forum.index"))
+    db = get_db()
+    t = now()
+    cap = cfg("MAX_JOINS_PER_HOUR")
+    if cap and db.execute("SELECT COUNT(*) FROM users WHERE created>?",
+                          (t - 3600,)).fetchone()[0] >= cap:
+        return render_index("Too many new accounts right now. Please try again later.", 429)
     secret = secrets.token_urlsafe(24)
     for _ in range(20):
-        handle = f"{secrets.choice(ADJ).title()}{secrets.choice(NOUN).title()}{secrets.randbelow(1000)}"
+        handle = (secrets.choice(ADJECTIVES).title() + secrets.choice(NOUNS).title()
+                  + str(secrets.randbelow(10000)))
         try:
-            db().execute("INSERT INTO users(handle,secret_hash,created) VALUES(?,?,?)",
-                         (handle, h(secret), now())); db().commit(); break
-        except sqlite3.IntegrityError: continue
-    resp = make_response(render_template_string(BASE, user=None, admin=False, msg=None, body=render_template_string(
-        """<h3>You are {{handle}}</h3><p>Your secret key (shown once — save it to log in on another device):</p>
-<p><code style="font-size:1.1em">{{secret}}</code></p><p><a href="/">Continue</a></p>""", handle=handle, secret=secret)))
+            db.execute("INSERT INTO users(handle,secret_hash,created) VALUES(?,?,?)",
+                       (handle, sha256_hex(secret), t))
+            db.commit()
+            break
+        except sqlite3.IntegrityError:
+            continue
+    else:
+        abort(503, "Could not allocate a handle. Please try again.")
+    # Render the confirmation page as the new account.
+    g.user = db.execute("SELECT * FROM users WHERE handle=?", (handle,)).fetchone()
+    resp = current_app.make_response(
+        render_template("joined.html", handle=handle, secret=secret,
+                        wait=cfg("NEW_ACCOUNT_WAIT")))
     return set_cookie(resp, "cg_secret", secret)
 
-@app.route("/login", methods=["GET", "POST"])
+
+@bp.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        s = request.form.get("secret", "").strip()
-        if db().execute("SELECT 1 FROM users WHERE secret_hash=?", (h(s),)).fetchone():
-            return set_cookie(redirect("/"), "cg_secret", s)
-        return page(LOGIN, msg="Unknown key.")
-    return page(LOGIN)
-LOGIN = """<h3>Log in</h3><form method=post><input type=text name=secret placeholder="Secret key"><button>Log in</button></form>"""
+        secret = request.form.get("secret", "").strip()
+        if secret and get_db().execute("SELECT 1 FROM users WHERE secret_hash=?",
+                                       (sha256_hex(secret),)).fetchone():
+            return set_cookie(redirect(url_for("forum.index")), "cg_secret", secret)
+        return render_template("login.html", msg="Unknown key."), 403
+    return render_template("login.html")
 
-@app.get("/rules")
+
+@bp.post("/logout")
+def logout():
+    return clear_cookie(redirect(url_for("forum.index", m="logged-out")), "cg_secret")
+
+
+@bp.get("/rules")
 def rules():
-    return page("""<h3>Rules</h3><ol>{% for r in rules %}<li>{{r}}</li>{% endfor %}</ol>
-<p>Moderators remove posts that break these rules and may mute accounts for a set time.
-Every action is listed publicly in the <a href="/modlog">mod log</a>. Disagreement alone is never grounds for removal.</p>""", rules=RULES)
+    return render_template("rules.html")
 
-@app.route("/verify", methods=["GET", "POST"])
+
+@bp.route("/verify", methods=["GET", "POST"])
 def verify():
-    u = current_user()
-    if not u: return redirect("/")
-    msg = None
+    user = current_user()
+    if not user:
+        return redirect(url_for("forum.index"))
+    msg, status = None, 200
     if request.method == "POST":
         try:
-            tok = json.loads(request.form.get("token", ""))
-            if verifier().redeem(tok):
-                db().execute("UPDATE users SET agent=1 WHERE id=?", (u["id"],)); db().commit()
-                return redirect("/")
-            msg = "Token rejected (invalid, expired, or already used)."
-        except (ValueError, KeyError, TypeError):
-            msg = "Malformed token."
-    return page("""<h3>Agent verification</h3><p>Paste the anonymous token issued to you by the agency's
-issuing service. The token proves employment without identifying you; this site stores only a one-way
-fingerprint so it cannot be reused.</p><form method=post><textarea name=token rows=6></textarea>
-<button>Verify</button></form>""", msg=msg)
+            token = json.loads(request.form.get("token", ""))
+        except ValueError:
+            token = None
+        db = get_db()
+        # The nullifier and the badge are committed together, so a crash
+        # cannot burn a token without granting what it paid for.
+        if Verifier(keyring(), db).redeem(token, commit=False):
+            db.execute("UPDATE users SET agent_epoch=? WHERE id=?", (token["epoch"], user["id"]))
+            db.commit()
+            return redirect(url_for("forum.index", m="verified"))
+        db.rollback()
+        msg, status = "Token rejected (malformed, invalid, expired, or already used).", 400
+    return render_template("verify.html", msg=msg), status
 
-@app.post("/new")
-def new_thread():
-    u = current_user(); err = can_post(u)
-    title, body = request.form.get("title", "").strip()[:150], request.form.get("body", "").strip()
-    if err or not title or not body: return page("", msg=err or "Title and text required.")
-    cur = db().execute("INSERT INTO threads(title,user_id,created) VALUES(?,?,?)", (title, u["id"], now()))
-    add_post(u, cur.lastrowid, body)
-    return redirect(f"/t/{cur.lastrowid}")
 
-@app.route("/t/<int:tid>", methods=["GET", "POST"])
-def thread(tid):
-    t = db().execute("SELECT * FROM threads WHERE id=?", (tid,)).fetchone()
-    if not t or (t["hidden"] and not is_admin()): abort(404)
-    msg = None
-    if request.method == "POST":
-        u = current_user(); msg = can_post(u); body = request.form.get("body", "").strip()
-        if not msg and body:
-            add_post(u, tid, body); return redirect(f"/t/{tid}#end")
-    posts = db().execute("""SELECT p.*, u.handle, u.agent FROM posts p JOIN users u ON u.id=p.user_id
-                            WHERE thread_id=? ORDER BY p.id""", (tid,)).fetchall()
-    return page("""<h2>{{t.title}}</h2>{% for p in posts %}""" + POST_TPL + """{% endfor %}<a id=end></a>
-{% if user %}<form method=post><textarea name=body rows=4 maxlength=4000 required></textarea><button>Reply</button></form>{% endif %}""",
-                msg=msg, t=t, posts=posts, fmt=fmt)
-
-@app.post("/report/<int:pid>")
+@bp.post("/report/<int:pid>")
 def report(pid):
-    if not current_user(): abort(403)
-    db().execute("INSERT INTO reports(post_id,reason,created) VALUES(?,?,?)",
-                 (pid, request.form.get("reason", "")[:200], now())); db().commit()
-    return page("", msg="Reported. A moderator will review it.")
+    user = current_user()
+    if not user:
+        abort(403)
+    rule = rule_from_form()
+    if rule is None:
+        abort(400)
+    db = get_db()
+    post = db.execute("SELECT thread_id, hidden FROM posts WHERE id=?", (pid,)).fetchone()
+    if not post:
+        abort(404)
+    back = url_for("forum.thread", tid=post["thread_id"])
+    if post["hidden"]:
+        return redirect(f"{back}?m=report-gone")
+    t = now()
+    cur = db.execute("UPDATE users SET last_report=? WHERE id=? AND last_report<=?",
+                     (t, user["id"], t - cfg("REPORT_INTERVAL")))
+    if cur.rowcount != 1:
+        db.rollback()
+        return redirect(f"{back}?m=report-wait#p{pid}")
+    # One report per account per post; repeats are silently ignored.
+    db.execute("INSERT OR IGNORE INTO reports(post_id,user_id,rule,created) VALUES(?,?,?,?)",
+               (pid, user["id"], rule, t))
+    db.commit()
+    return redirect(f"{back}?m=reported#p{pid}")
 
-@app.get("/modlog")
+
+@bp.get("/modlog")
 def modlog():
-    rows = db().execute("SELECT * FROM modlog ORDER BY id DESC LIMIT 200").fetchall()
-    return page("""<h3>Public moderation log</h3>{% for r in rows %}<div class=meta>{{fmt(r.created)}} —
-<b>{{r.action}}</b> {{r.target}}: {{r.reason}}</div>{% else %}<p>No actions yet.</p>{% endfor %}""", rows=rows, fmt=fmt)
+    size, page = cfg("PAGE_SIZE"), page_number()
+    rows = get_db().execute("SELECT * FROM modlog ORDER BY id DESC LIMIT ? OFFSET ?",
+                            (size + 1, (page - 1) * size)).fetchall()
+    return render_template("modlog.html", rows=rows[:size], page=page,
+                           has_next=len(rows) > size)
 
-# ------------------------------------------------------------------ admin
-@app.route("/admin", methods=["GET", "POST"])
+
+# --------------------------------------------------------------------- admin
+@bp.get("/admin")
 def admin():
-    if request.method == "POST":
-        resp = redirect("/admin")
-        return set_cookie(resp, "cg_admin", request.form.get("key", ""))
     if not is_admin():
-        return page("""<h3>Admin login</h3><form method=post><input type=text name=key><button>Enter</button></form>""")
-    reps = db().execute("""SELECT r.id rid, r.reason, p.*, u.handle, u.agent FROM reports r
-        JOIN posts p ON p.id=r.post_id JOIN users u ON u.id=p.user_id
-        WHERE r.resolved=0 ORDER BY r.id""").fetchall()
-    return page("""<h3>Report queue ({{reps|length}})</h3>{% for p in reps %}""" + POST_TPL + """
-<form method=post action="/admin/resolve/{{p.rid}}"><button>Dismiss report</button></form>
-{% else %}<p>Queue empty.</p>{% endfor %}""", reps=reps, fmt=fmt)
+        return render_template("admin_login.html", enabled=admin_token() is not None)
+    queue = get_db().execute(
+        """SELECT p.*, u.handle, COUNT(*) AS n_reports,
+                  GROUP_CONCAT(DISTINCT r.rule) AS rules_cited
+           FROM reports r JOIN posts p ON p.id=r.post_id JOIN users u ON u.id=p.user_id
+           WHERE r.resolved=0 GROUP BY p.id ORDER BY MIN(r.id)""").fetchall()
+    return render_template("admin.html", queue=queue)
 
-@app.route("/admin/post/<int:pid>", methods=["GET", "POST"])
+
+@bp.post("/admin/login")
+def admin_login():
+    token = admin_token()
+    if token is None or not same(request.form.get("key", ""), cfg("ADMIN_KEY")):
+        return render_template("admin_login.html", enabled=token is not None,
+                               msg="Wrong key."), 403
+    # Session cookie: admin access ends when the browser closes.
+    return set_cookie(redirect(url_for("forum.admin")), "cg_admin", token, max_age=None)
+
+
+@bp.post("/admin/logout")
+def admin_logout():
+    return clear_cookie(redirect(url_for("forum.index")), "cg_admin")
+
+
+@bp.route("/admin/post/<int:pid>", methods=["GET", "POST"])
 def admin_post(pid):
-    if not is_admin(): abort(403)
-    p = db().execute("SELECT p.*, u.handle, u.agent FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=?", (pid,)).fetchone()
-    if not p: abort(404)
+    require_admin()
+    db = get_db()
+    p = db.execute(
+        """SELECT p.*, u.handle, u.muted_until, t.title, t.title_hidden,
+                  (SELECT MIN(id) FROM posts WHERE thread_id=p.thread_id) = p.id AS is_opener,
+                  (SELECT COUNT(*) FROM reports r
+                    WHERE r.post_id=p.id AND r.resolved=0) AS n_reports
+           FROM posts p JOIN users u ON u.id=p.user_id JOIN threads t ON t.id=p.thread_id
+           WHERE p.id=?""", (pid,)).fetchone()
+    if not p:
+        abort(404)
     if request.method == "POST":
-        rule = request.form.get("rule", "")
-        days = int(request.form.get("mute_days", "0") or 0)
-        db().execute("UPDATE posts SET hidden=1 WHERE id=?", (pid,))
-        db().execute("UPDATE reports SET resolved=1 WHERE post_id=?", (pid,))
-        log_mod("removed post", f"#{pid} by {p['handle']}", rule)
-        if days > 0:
-            db().execute("UPDATE users SET muted_until=? WHERE id=?", (now() + days*86400, p["user_id"]))
-            log_mod(f"muted {days}d", p["handle"], rule)
-        db().commit()
-        return redirect("/admin")
-    return page(POST_TPL + """<form method=post><p>Rule broken:</p><select name=rule>
-{% for r in rules %}<option>{{r}}</option>{% endfor %}</select>
-<p>Mute author for <input type=number name=mute_days value=0 min=0 max=365 style="width:5em"> days (0 = no mute)</p>
-<button>Remove post</button></form>""", p=p, rules=RULES, fmt=fmt)
+        moderate(db, p)
+        db.commit()
+        return redirect(url_for("forum.admin_post", pid=pid))
+    return render_template("admin_post.html", p=p, muted=p["muted_until"] > now(),
+                           max_mute=cfg("MAX_MUTE_DAYS"))
 
-@app.post("/admin/resolve/<int:rid>")
-def admin_resolve(rid):
-    if not is_admin(): abort(403)
-    db().execute("UPDATE reports SET resolved=1 WHERE id=?", (rid,)); db().commit()
-    return redirect("/admin")
+
+def moderate(db, p) -> None:
+    """Apply one moderation action to post row p. Every state change is
+    written to the public log; removals must cite a rule."""
+    action = request.form.get("action", "")
+    pid, target = p["id"], f"#{p['id']} by {p['handle']}"
+
+    if action in ("remove", "hide_title"):
+        rule = rule_from_form()
+        if rule is None:
+            abort(400, "Removal must cite a rule.")
+        reason = rule_label(rule)
+        if action == "remove" and not p["hidden"]:
+            try:
+                days = int(request.form.get("mute_days", "0") or 0)
+            except ValueError:
+                abort(400, "Mute length must be a whole number of days.")
+            days = max(0, min(days, cfg("MAX_MUTE_DAYS")))
+            db.execute("UPDATE posts SET hidden=1 WHERE id=?", (pid,))
+            db.execute("UPDATE reports SET resolved=1 WHERE post_id=?", (pid,))
+            log_mod("removed post", target, reason)
+            if days:
+                # MAX() so a new mute never shortens one already running.
+                db.execute("UPDATE users SET muted_until=MAX(muted_until, ?) WHERE id=?",
+                           (now() + days * 86400, p["user_id"]))
+                log_mod(f"muted {days}d", p["handle"], reason)
+        elif action == "hide_title" and p["is_opener"] and not p["title_hidden"]:
+            db.execute("UPDATE threads SET title_hidden=1 WHERE id=?", (p["thread_id"],))
+            log_mod("removed title", f"thread #{p['thread_id']} by {p['handle']}", reason)
+    elif action == "restore" and p["hidden"]:
+        db.execute("UPDATE posts SET hidden=0 WHERE id=?", (pid,))
+        log_mod("restored post", target, "Reinstated after review")
+    elif action == "restore_title" and p["is_opener"] and p["title_hidden"]:
+        db.execute("UPDATE threads SET title_hidden=0 WHERE id=?", (p["thread_id"],))
+        log_mod("restored title", f"thread #{p['thread_id']} by {p['handle']}",
+                "Reinstated after review")
+    elif action == "unmute" and p["muted_until"] > now():
+        db.execute("UPDATE users SET muted_until=0 WHERE id=?", (p["user_id"],))
+        log_mod("lifted mute", p["handle"], "Lifted after review")
+    elif action == "dismiss" and p["n_reports"]:
+        db.execute("UPDATE reports SET resolved=1 WHERE post_id=?", (pid,))
+        log_mod("dismissed reports", f"on post {target}", "No rule violation found")
+    elif action not in ("remove", "hide_title", "restore", "restore_title",
+                        "unmute", "dismiss"):
+        abort(400)
+
+
+# ------------------------------------------------------------------- factory
+def create_app(config: dict | None = None) -> Flask:
+    app = Flask(__name__)
+    app.config.update(DEFAULTS)
+    app.config.update(
+        DB=os.environ.get("CG_DB", "commonground.db"),
+        KEYRING=os.environ.get("CG_KEYRING", "keyring.json"),
+        ADMIN_KEY=os.environ.get("ADMIN_KEY"),
+        # Secure by default; only plain-HTTP local testing should turn it off.
+        COOKIE_SECURE=os.environ.get("CG_COOKIE_SECURE", "1") != "0",
+    )
+    app.config.update(config or {})
+    app.jinja_env.filters["ts"] = fmt_time
+    app.register_blueprint(bp)
+    init_db(app.config["DB"])
+
+    key = app.config["ADMIN_KEY"]
+    if not key:
+        app.logger.warning("ADMIN_KEY not set; admin panel disabled.")
+    elif len(key) < app.config["MIN_ADMIN_KEY_LEN"]:
+        app.logger.warning("ADMIN_KEY is shorter than %d characters; admin panel disabled.",
+                           app.config["MIN_ADMIN_KEY_LEN"])
+    return app
+
 
 if __name__ == "__main__":
-    if not ADMIN_KEY: print("Warning: ADMIN_KEY not set; admin panel disabled.")
-    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", 5000)))
+    # The development server's access log records client IPs; silence it.
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    # It also speaks plain HTTP on loopback, where Secure cookies would not
+    # be sent by every browser. Set CG_COOKIE_SECURE=1 to force them anyway.
+    dev_app = create_app({"COOKIE_SECURE": os.environ.get("CG_COOKIE_SECURE") == "1"})
+    port = int(os.environ.get("PORT", "5000"))
+    print(f"Common Ground running at http://127.0.0.1:{port}  (Ctrl+C to stop)")
+    dev_app.run(host="127.0.0.1", port=port)

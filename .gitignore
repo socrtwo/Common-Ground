@@ -1,9 +1,25 @@
+# Python
 __pycache__/
+*.py[cod]
 venv/
 .venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local runtime state: databases, keys, and issuer material must never be committed
 .env
 *.db
+*.db-wal
+*.db-shm
 *.pem
 *.key
 keyring.json
 demo_issuer/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

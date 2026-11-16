@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Agent verification</h1>
+<p>Paste the anonymous token issued to you by the agency's issuing service. The token
+proves employment without identifying you; this site stores only a one-way fingerprint
+of it so it cannot be reused.</p>
+<p class="meta">The badge marks posts made after verification and lapses when the
+issuing period ends.</p>
+<form method="post">{{ csrf_field }}
+  <textarea name="token" rows="6" aria-label="Token" autocomplete="off" spellcheck="false" required></textarea>
+  <button>Verify</button>
+</form>
+{% endblock %}

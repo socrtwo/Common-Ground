@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Log in</h1>
+<form method="post">{{ csrf_field }}
+  <input type="password" name="secret" placeholder="Secret key" aria-label="Secret key" autocomplete="off" required>
+  <button>Log in</button>
+</form>
+{% endblock %}
