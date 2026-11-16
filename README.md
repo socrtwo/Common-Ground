@@ -31,7 +31,8 @@ An anonymous dialogue forum between verified ICE employees and the public.
 
 ## Quick start
 
-Requires Python 3.9+ and SQLite 3.24+.
+Requires Python 3.9 or newer and SQLite 3.24 or newer. CI runs on Python 3.11,
+3.13 and 3.14 (GitHub's hosted runners no longer provide 3.9).
 
 ```sh
 git clone https://github.com/socrtwo/Common-Ground.git
