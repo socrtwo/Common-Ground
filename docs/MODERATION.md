@@ -25,14 +25,21 @@
   one already running.
 - Mistakes are reversible. Moderators can restore a post or title and lift a
   mute; each of those is logged too.
+- A removed post or title can then be purged, which erases the text for
+  good. This is for doxxing and similar material that must not linger. It
+  is logged, cannot be undone, and leaves the placeholder in place.
 - Members report a post by choosing the rule they believe it breaks. One
   report per member per post. Dismissing reports without removal is logged.
 - The log shows the action, the target (post number and handle), the rule or
-  reason, and the time. It never shows who filed a report.
+  reason, the time, and the acting moderator's label. It never shows who
+  filed a report.
+- Each moderator can be given their own key (`CG_MOD_KEYS`) with a public
+  label such as `agent-side` or `community`, so readers of the log can see
+  which side acted. Labels should be roles, never names.
 
 ## What the software does not do
-- It does not record which moderator acted: all moderators share one key.
-  The two-sided team above is an operating commitment that the people
-  running a site must keep.
-- It does not delete removed content from the database, so that it can be
-  restored. Doxxing material should additionally be purged by the operator.
+- It does not verify who holds a key, stop moderators sharing one, or
+  require that both sides be represented. The two-sided team above is an
+  operating commitment that the people running a site must keep.
+- It does not purge automatically. Removed content stays in the database
+  until a moderator purges it.

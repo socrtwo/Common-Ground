@@ -3,7 +3,7 @@
 {% block content %}
 <h1>Public moderation log</h1>
 {% for r in rows %}
-<div class="meta">{{ r.created|ts }} — <b>{{ r.action }}</b> {{ r.target }}: {{ r.reason }}</div>
+<div class="meta">{{ r.created|ts }} — <b>{{ r.action }}</b> {{ r.target }}: {{ r.reason }}{% if r.moderator %} (by {{ r.moderator }}){% endif %}</div>
 {% else %}
 <p>No actions yet.</p>
 {% endfor %}
