@@ -10,13 +10,21 @@ Roles:
              published public key for that epoch and records a nullifier so
              a token can be redeemed only once.
 
-Scheme: RSA full-domain-hash blind signature (textbook Chaum). This module is
-unaudited demonstration code. Production must use an audited RFC 9474
-(RSABSSA) implementation inside a Privacy Pass (RFC 9576/9578) flow.
+Scheme: RSABSSA-SHA384-PSS-Deterministic from RFC 9474, the variant Privacy
+Pass uses for publicly verifiable tokens (RFC 9578). "Deterministic" is safe
+here because every message carries a fresh 256-bit nonce. A finished token is
+an ordinary RSASSA-PSS signature, so the Verifier and the Holder check it
+with the `cryptography` library rather than with code in this file.
 
-Wire formats (all integers are lowercase hex strings without a 0x prefix):
+What is still hand-written, and has NOT been independently audited: the PSS
+encoding and blinding on the Holder's side and the raw private-key operation
+on the Issuer's side (`cryptography` exposes neither). Python integer
+arithmetic is not constant-time. A production issuer needs an audited RFC
+9474 implementation with its key in an HSM.
+
+Wire formats (integers and byte strings are lowercase hex, no 0x prefix):
   public key  {"epoch": str, "n": hex, "e": 65537, "expires": unix-seconds?}
-  token       {"epoch": str, "nonce": 64 hex chars, "sig": hex}
+  token       {"epoch": str, "nonce": 64 hex chars, "sig": hex, modulus length}
 """
 from __future__ import annotations
 
@@ -30,13 +38,16 @@ import sqlite3
 import time
 from math import gcd
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 PUBLIC_EXPONENT = 65537
 MIN_MODULUS_BITS = 2048
 DEFAULT_MODULUS_BITS = 3072
 NONCE_HEX_LEN = 64
+HASH = hashlib.sha384
+SALT_LEN = 48                       # RFC 9474: salt as long as the hash output
 
 # Epoch names end up in file names and signed messages, so keep them boring.
 _EPOCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
@@ -71,15 +82,36 @@ def _token_message(epoch: str, nonce: str) -> bytes:
     return b"common-ground/token/v1\x00" + epoch.encode() + b"\x00" + nonce.encode()
 
 
-def _fdh(msg: bytes, n: int) -> int:
-    """Full-domain hash onto Z_n.
+def _mgf1(seed: bytes, length: int) -> bytes:
+    """MGF1 mask generation (RFC 8017, B.2.1) with SHA-384."""
+    out = b""
+    for counter in range(-(-length // HASH().digest_size)):
+        out += HASH(seed + counter.to_bytes(4, "big")).digest()
+    return out[:length]
 
-    Squeezes 16 bytes more than the modulus length from SHAKE-256 so the
-    reduction mod n is statistically uniform.
-    """
-    k = (n.bit_length() + 7) // 8
-    wide = hashlib.shake_256(b"common-ground/fdh/v1\x00" + msg).digest(k + 16)
-    return int.from_bytes(wide, "big") % n
+
+def _emsa_pss_encode(msg: bytes, em_bits: int, salt: bytes) -> bytes:
+    """EMSA-PSS-ENCODE (RFC 8017, 9.1.1) with SHA-384 and MGF1-SHA-384."""
+    h_len, em_len = HASH().digest_size, (em_bits + 7) // 8
+    if em_len < h_len + len(salt) + 2:
+        raise ValueError("modulus too small for PSS encoding")
+    h = HASH(b"\x00" * 8 + HASH(msg).digest() + salt).digest()
+    db = b"\x00" * (em_len - len(salt) - h_len - 2) + b"\x01" + salt
+    masked = bytearray(x ^ y for x, y in zip(db, _mgf1(h, len(db))))
+    masked[0] &= 0xFF >> (8 * em_len - em_bits)
+    return bytes(masked) + h + b"\xbc"
+
+
+def _pss_verify(n: int, e: int, msg: bytes, sig: bytes) -> bool:
+    """RSASSA-PSS verification, done by the `cryptography` library."""
+    try:
+        rsa.RSAPublicNumbers(e, n).public_key().verify(
+            sig, msg,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA384()), salt_length=SALT_LEN),
+            hashes.SHA384())
+    except (InvalidSignature, ValueError):
+        return False
+    return True
 
 
 def _random_unit(n: int) -> int:
@@ -265,7 +297,11 @@ class Holder:
         """Returns (state_to_keep_secret, blinded_value_to_send_issuer)."""
         nonce = secrets.token_hex(NONCE_HEX_LEN // 2)
         r = _random_unit(self.n)
-        m = _fdh(_token_message(self.epoch, nonce), self.n)
+        encoded = _emsa_pss_encode(_token_message(self.epoch, nonce),
+                                   self.n.bit_length() - 1, secrets.token_bytes(SALT_LEN))
+        m = int.from_bytes(encoded, "big")
+        if gcd(m, self.n) != 1:                       # RFC 9474 Blind, step 5
+            raise ValueError("encoded message is not invertible")
         blinded = (m * pow(r, self.e, self.n)) % self.n
         return {"epoch": self.epoch, "nonce": nonce, "r": _to_hex(r)}, _to_hex(blinded)
 
@@ -276,11 +312,11 @@ class Holder:
         valid signature, so a bad token is caught before it is spent.
         """
         r = _from_hex(state["r"])
-        sig = (_from_hex(blind_sig_hex) * pow(r, -1, self.n)) % self.n
-        m = _fdh(_token_message(state["epoch"], state["nonce"]), self.n)
-        if pow(sig, self.e, self.n) != m:
+        k = (self.n.bit_length() + 7) // 8
+        sig = ((_from_hex(blind_sig_hex) * pow(r, -1, self.n)) % self.n).to_bytes(k, "big")
+        if not _pss_verify(self.n, self.e, _token_message(state["epoch"], state["nonce"]), sig):
             raise ValueError("issuer returned an invalid signature")
-        return {"epoch": state["epoch"], "nonce": state["nonce"], "sig": _to_hex(sig)}
+        return {"epoch": state["epoch"], "nonce": state["nonce"], "sig": sig.hex()}
 
 
 # ------------------------------------------------------------------ Verifier
@@ -314,15 +350,19 @@ class Verifier:
         pk = self.keyring.get(epoch)
         if pk is None:
             return False                                # unknown epoch
+        sig_hex = tok.get("sig")
         try:
             n, e = parse_public_key(pk)
-            sig = _from_hex(tok.get("sig"))
+            sig = _from_hex(sig_hex)
         except ValueError:
             return False
-        if not key_is_active(pk, now) or not 0 < sig < n:
+        # Exactly one encoding per signature: full modulus length, below n.
+        if len(sig_hex) != 2 * ((n.bit_length() + 7) // 8) or not 0 < sig < n:
+            return False
+        if not key_is_active(pk, now):
             return False
         msg = _token_message(epoch, nonce)
-        if pow(sig, e, n) != _fdh(msg, n):
+        if not _pss_verify(n, e, msg, bytes.fromhex(sig_hex)):
             return False                                # forged or wrong key
         nullifier = hashlib.sha256(b"common-ground/nullifier/v1\x00" + msg).hexdigest()
         try:

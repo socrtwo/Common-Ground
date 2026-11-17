@@ -4,6 +4,9 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    # requirements*.txt hold minimum versions (">="). Only raise a minimum
+    # when a new release falls outside the range, not on every release.
+    versioning-strategy: increase-if-necessary
   - package-ecosystem: github-actions
     directory: /
     schedule:

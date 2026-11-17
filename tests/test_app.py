@@ -385,10 +385,10 @@ def test_no_ip_address_is_stored(application, member, browser):
 
 
 # ------------------------------------------------------- moderator identities
-def team_app(tmp_path, keyring_path, mod_keys, admin_key=None):
+def team_app(tmp_path, keyring_path, mod_keys, admin_key=None, **extra):
     return forum.create_app({"TESTING": True, "DB": str(tmp_path / "team.db"),
                              "KEYRING": str(keyring_path), "ADMIN_KEY": admin_key,
-                             "MOD_KEYS": mod_keys, "COOKIE_SECURE": False,
+                             "MOD_KEYS": mod_keys, "COOKIE_SECURE": False, **extra,
                              "NEW_ACCOUNT_WAIT": 0})
 
 
@@ -505,3 +505,90 @@ def test_schema_2_database_is_migrated_in_place(tmp_path, keyring_path):
     assert query(application, "SELECT action, moderator FROM modlog") == [("removed post", "")]
     assert query(application, "SELECT COUNT(purged) FROM posts") == [(0,)]
     assert b"removed post" in application.test_client().get("/modlog").data
+
+
+# ----------------------------------------------------------- moderator sides
+SIDED = "a1@agent=agent-key-0123456789,c1@community=community-key-012345"
+
+
+def test_agent_side_key_needs_a_valid_badge(tmp_path, keyring_path, mint, clock):
+    application = team_app(tmp_path, keyring_path, SIDED)
+    mod, post = client_for(application)
+    post("/join")
+    post("/new", title="T", body="text")
+    assert post("/admin/login", key="agent-key-0123456789").status_code == 302
+    assert mod.get("/admin").status_code == 403                    # no badge yet
+    assert b"valid agent badge" in mod.get("/admin").data
+    assert post("/admin/post/1", action="remove", rule="3").status_code == 403
+    assert query(application, "SELECT COUNT(*) FROM modlog") == [(0,)]
+
+    post("/verify", token=json.dumps(mint()))
+    assert mod.get("/admin").status_code == 200
+    assert post("/admin/post/1", action="remove", rule="3").status_code == 302
+    assert query(application, "SELECT moderator FROM modlog") == [("a1 (agent side)",)]
+
+    keyring_path.write_text("{}")                                  # badge lapses
+    assert mod.get("/admin/post/1").status_code == 403
+
+
+def test_community_side_key_is_labelled_and_needs_no_badge(tmp_path, keyring_path):
+    application = team_app(tmp_path, keyring_path, SIDED)
+    member, post = client_for(application)
+    post("/join")
+    post("/new", title="T", body="text")
+    mod, mod_post = client_for(application)
+    mod_post("/admin/login", key="community-key-012345")
+    assert b"Admin (c1 (community side))" in mod.get("/").data
+    mod_post("/admin/post/1", action="remove", rule="3")
+    assert b"(by c1 (community side))" in member.get("/modlog").data
+
+
+@pytest.mark.parametrize("keys,admin_key,enabled", [
+    (SIDED, None, ["a1", "c1"]),
+    (SIDED, "legacy-key-0123456789", ["a1", "c1"]),               # unsided key ignored
+    ("a1@agent=agent-key-0123456789", None, []),                   # one side only
+    ("c1@community=community-key-012345,c2@community=community-key-0123456", None, []),
+    ("a1@agent=agent-key-0123456789,c1@community=short", None, []),
+    ("plain=plain-key-0123456789ab", "legacy-key-0123456789", []),
+])
+def test_require_both_sides(tmp_path, keyring_path, keys, admin_key, enabled):
+    application = team_app(tmp_path, keyring_path, keys, admin_key, REQUIRE_BOTH_SIDES=True)
+    with application.test_request_context("/"):
+        assert sorted(forum.moderators()) == enabled
+    client, post = client_for(application)
+    assert (b"disabled" in client.get("/admin").data) == (not enabled)
+    if not enabled:
+        assert post("/admin/login", key="agent-key-0123456789").status_code == 403
+
+
+def test_invalid_side_is_rejected(tmp_path, keyring_path):
+    application = team_app(tmp_path, keyring_path, "x@police=some-key-0123456789ab")
+    with application.test_request_context("/"):
+        assert forum.moderators() == {}
+
+
+# ------------------------------------------------------------- purge scrubbing
+def test_purged_text_is_gone_from_the_database_files(application, member, browser):
+    secret_text = "ZQXJ-unique-marker-742-Elm-Street"
+    start_thread(member, "Title " + secret_text, "Body " + secret_text)
+    mod = browser()
+    mod.admin_login()
+
+    def on_disk():
+        import glob
+        return any(secret_text.encode() in open(f, "rb").read()
+                   for f in glob.glob(application.config["DB"] + "*"))
+
+    # A second, idle connection (another worker, say) keeps the journal file
+    # alive, so only an explicit scrub can clear it.
+    other = sqlite3.connect(application.config["DB"])
+    other.execute("SELECT COUNT(*) FROM posts").fetchall()
+    assert on_disk()
+    mod.post("/admin/post/1", {"action": "remove", "rule": "1"})
+    mod.post("/admin/post/1", {"action": "hide_title", "rule": "1"})
+    assert on_disk()                                               # removal only hides
+    mod.post("/admin/post/1", {"action": "purge"})
+    mod.post("/admin/post/1", {"action": "purge_title"})
+    assert not on_disk()
+    other.close()
+    assert b"purged post content" in member.get("/modlog").data    # the log survives
