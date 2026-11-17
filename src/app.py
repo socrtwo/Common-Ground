@@ -2,7 +2,7 @@
 Common Ground - anonymous dialogue between verified ICE employees and the public.
 
 Run:   ADMIN_KEY=<16+ chars> python3 app.py      ->  http://127.0.0.1:5000
-       (or CG_MOD_KEYS="label=key,label=key" for one key per moderator)
+       (or CG_MOD_KEYS="label@agent=key,label@community=key", one per moderator)
 WSGI:  gunicorn 'app:create_app()'
 
 - No email, phone, or IP is stored. Accounts are a random handle + secret key.
@@ -174,6 +174,9 @@ def get_db() -> sqlite3.Connection:
         g.db = sqlite3.connect(current_app.config["DB"], timeout=10)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys=ON")
+        # Overwrite deleted or replaced content with zeros instead of leaving
+        # it in free space inside the file.
+        g.db.execute("PRAGMA secure_delete=ON")
     return g.db
 
 
@@ -235,23 +238,56 @@ def badge_active(user) -> bool:
     return pk is not None and key_is_active(pk)
 
 
-def parse_mod_keys(text: str | None) -> tuple[dict, list]:
-    """Parse CG_MOD_KEYS: 'label=key' entries separated by commas or newlines.
-    Returns ({label: key}, [descriptions of rejected entries])."""
-    keys, bad = {}, []
+SIDES = ("agent", "community")
+
+
+def parse_mod_keys(text: str | None) -> tuple[dict, dict, list]:
+    """Parse CG_MOD_KEYS: 'label=key' or 'label@side=key' entries separated
+    by commas or newlines, side being 'agent' or 'community'.
+    Returns ({label: key}, {label: side or ''}, [rejected-entry descriptions])."""
+    keys, sides, bad = {}, {}, []
     for entry in re.split(r"[,\n]", text or ""):
         entry = entry.strip()
         if not entry:
             continue
-        label, sep, key = entry.partition("=")
-        label = label.strip()
+        name, sep, key = entry.partition("=")
+        label, at, side = name.strip().partition("@")
         if not sep or not MOD_LABEL_RE.fullmatch(label):
             bad.append("an entry without a valid label")
+        elif at and side not in SIDES:
+            bad.append(f"{label!r}: side must be 'agent' or 'community'")
         elif label in keys:
             bad.append(f"duplicate label {label!r}")
         else:
-            keys[label] = key.strip()
-    return keys, bad
+            keys[label], sides[label] = key.strip(), side
+    return keys, sides, bad
+
+
+def usable_moderators(config) -> tuple[dict, dict, list]:
+    """Apply the key rules to the configuration.
+    Returns ({label: key}, {label: side}, [warnings for the operator])."""
+    keys, sides, warnings = parse_mod_keys(config["MOD_KEYS"])
+    warnings = [f"CG_MOD_KEYS: ignoring {problem}." for problem in warnings]
+    if config["ADMIN_KEY"] and "moderator" not in keys:
+        keys["moderator"], sides["moderator"] = config["ADMIN_KEY"], ""
+    short = sorted(k for k in keys if len(keys[k]) < config["MIN_ADMIN_KEY_LEN"])
+    if short:
+        warnings.append(f"Ignoring moderator key(s) shorter than "
+                        f"{config['MIN_ADMIN_KEY_LEN']} characters: {', '.join(short)}.")
+    if config["REQUIRE_BOTH_SIDES"]:
+        unassigned = sorted(k for k in keys if not sides[k])
+        if unassigned:
+            warnings.append("CG_REQUIRE_BOTH_SIDES: ignoring key(s) with no side: "
+                            f"{', '.join(unassigned)}.")
+        short += unassigned
+    keys = {k: v for k, v in keys.items() if k not in short}
+    if config["REQUIRE_BOTH_SIDES"] and {sides[k] for k in keys} != set(SIDES):
+        warnings.append("CG_REQUIRE_BOTH_SIDES: moderation is disabled until an agent-side "
+                        "and a community-side key are both configured.")
+        keys = {}
+    elif not keys:
+        warnings.append("No usable ADMIN_KEY or CG_MOD_KEYS; admin panel disabled.")
+    return keys, {k: sides[k] for k in keys}, warnings
 
 
 def moderators() -> dict:
@@ -259,12 +295,29 @@ def moderators() -> dict:
     single-key shorthand and logs as 'moderator'; CG_MOD_KEYS gives each
     moderator their own key so the public log shows who acted."""
     if "moderators" not in g:
-        keys, _ = parse_mod_keys(cfg("MOD_KEYS"))
-        if cfg("ADMIN_KEY"):
-            keys.setdefault("moderator", cfg("ADMIN_KEY"))
-        g.moderators = {label: key for label, key in keys.items()
-                        if len(key) >= cfg("MIN_ADMIN_KEY_LEN")}
+        g.moderators, g.mod_sides, _ = usable_moderators(current_app.config)
     return g.moderators
+
+
+def moderator_side(label: str | None) -> str:
+    moderators()
+    return g.mod_sides.get(label, "")
+
+
+def moderator_name() -> str:
+    """How the acting moderator appears in the public log."""
+    label = current_moderator()
+    side = moderator_side(label)
+    return f"{label} ({side} side)" if side else (label or "")
+
+
+def moderator_block() -> str | None:
+    """An agent-side key is honoured only from an account whose badge is
+    currently valid, so 'agent side' in the log means a verified employee."""
+    if moderator_side(current_moderator()) == "agent" and not badge_active(current_user()):
+        return ("This is an agent-side moderator key. Log in to a forum account "
+                "with a valid agent badge to use it.")
+    return None
 
 
 def admin_token(label: str) -> str:
@@ -292,6 +345,8 @@ def is_admin() -> bool:
 def require_admin() -> None:
     if not is_admin():
         abort(403)
+    if moderator_block():
+        abort(403, moderator_block())
 
 
 def set_cookie(resp, name: str, value: str, max_age: int | None = COOKIE_MAX_AGE):
@@ -322,7 +377,7 @@ def log_mod(action: str, target: str, reason: str) -> None:
     """Append to the public moderation log (caller commits)."""
     get_db().execute(
         "INSERT INTO modlog(action,target,reason,created,moderator) VALUES(?,?,?,?,?)",
-        (action, target, reason, now(), current_moderator() or ""))
+        (action, target, reason, now(), moderator_name()))
 
 
 def page_number() -> int:
@@ -368,7 +423,7 @@ def template_context():
         "user": user,
         "user_is_agent": badge_active(user),
         "admin": is_admin(),
-        "moderator": current_moderator(),
+        "moderator": moderator_name(),
         "rules": RULES,
         "notice": NOTICES.get(request.args.get("m", "")),
         "csrf_field": Markup('<input type="hidden" name="csrf" value="{}">').format(
@@ -626,6 +681,8 @@ def modlog():
 def admin():
     if not is_admin():
         return render_template("admin_login.html", enabled=bool(moderators()))
+    if moderator_block():
+        return render_template("admin_login.html", enabled=True, msg=moderator_block()), 403
     queue = get_db().execute(
         """SELECT p.*, u.handle, COUNT(*) AS n_reports,
                   GROUP_CONCAT(DISTINCT r.rule) AS rules_cited
@@ -669,9 +726,24 @@ def admin_post(pid):
     if request.method == "POST":
         moderate(db, p)
         db.commit()
+        if g.pop("scrub", False):
+            scrub_database(db)
         return redirect(url_for("forum.admin_post", pid=pid))
     return render_template("admin_post.html", p=p, muted=p["muted_until"] > now(),
                            max_mute=cfg("MAX_MUTE_DAYS"))
+
+
+def scrub_database(db) -> None:
+    """After a purge, remove the erased text from the journal and from free
+    pages too. Best effort: if other connections are busy the next purge (or
+    a manual VACUUM) finishes the job. Backups are out of reach from here."""
+    try:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        db.execute("VACUUM")
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.OperationalError as ex:
+        current_app.logger.warning("Purge committed, but the database scrub was "
+                                   "skipped (%s). Run VACUUM when the site is idle.", ex)
 
 
 def moderate(db, p) -> None:
@@ -720,10 +792,12 @@ def moderate(db, p) -> None:
         # similar material that must not linger in the database.
         db.execute("UPDATE posts SET body='', purged=1 WHERE id=?", (pid,))
         log_mod("purged post content", target, "Erased permanently")
+        g.scrub = True
     elif action == "purge_title" and p["is_opener"] and p["title_hidden"] and p["title"]:
         db.execute("UPDATE threads SET title='' WHERE id=?", (p["thread_id"],))
         log_mod("purged title", f"thread #{p['thread_id']} by {p['handle']}",
                 "Erased permanently")
+        g.scrub = True
     elif action not in ("remove", "hide_title", "restore", "restore_title",
                         "unmute", "dismiss", "purge", "purge_title"):
         abort(400)
@@ -738,6 +812,7 @@ def create_app(config: dict | None = None) -> Flask:
         KEYRING=os.environ.get("CG_KEYRING", "keyring.json"),
         ADMIN_KEY=os.environ.get("ADMIN_KEY"),
         MOD_KEYS=os.environ.get("CG_MOD_KEYS"),
+        REQUIRE_BOTH_SIDES=os.environ.get("CG_REQUIRE_BOTH_SIDES") == "1",
         # Secure by default; only plain-HTTP local testing should turn it off.
         COOKIE_SECURE=os.environ.get("CG_COOKIE_SECURE", "1") != "0",
     )
@@ -746,18 +821,8 @@ def create_app(config: dict | None = None) -> Flask:
     app.register_blueprint(bp)
     init_db(app.config["DB"])
 
-    keys, bad = parse_mod_keys(app.config["MOD_KEYS"])
-    if app.config["ADMIN_KEY"]:
-        keys.setdefault("moderator", app.config["ADMIN_KEY"])
-    short = sorted(label for label, key in keys.items()
-                   if len(key) < app.config["MIN_ADMIN_KEY_LEN"])
-    for problem in bad:
-        app.logger.warning("CG_MOD_KEYS: ignoring %s.", problem)
-    if short:
-        app.logger.warning("Ignoring moderator key(s) shorter than %d characters: %s.",
-                           app.config["MIN_ADMIN_KEY_LEN"], ", ".join(short))
-    if len(keys) == len(short):
-        app.logger.warning("No usable ADMIN_KEY or CG_MOD_KEYS; admin panel disabled.")
+    for warning in usable_moderators(app.config)[2]:
+        app.logger.warning(warning)
     return app
 
 

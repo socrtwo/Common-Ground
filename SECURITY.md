@@ -27,8 +27,8 @@ and which commit you tested.
 
 ## Already known
 
-- The blind-signature code is unaudited textbook RSA and must be replaced
-  before any real deployment (see `docs/VERIFICATION.md`).
+- The issuing and blinding code is hand-written, unaudited Python and must
+  be replaced before any real deployment (see `docs/VERIFICATION.md`).
 - The limits listed under "Known limitations" in the README.
 
 ## Supported versions

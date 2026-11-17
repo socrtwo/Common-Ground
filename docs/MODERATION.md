@@ -34,12 +34,19 @@
   reason, the time, and the acting moderator's label. It never shows who
   filed a report.
 - Each moderator can be given their own key (`CG_MOD_KEYS`) with a public
-  label such as `agent-side` or `community`, so readers of the log can see
-  which side acted. Labels should be roles, never names.
+  label and a side, `agent` or `community`. The log shows both, so readers
+  can see which side acted. Labels should be roles, never names.
+- An agent-side key works only from a forum account whose agent badge is
+  currently valid. "Agent side" in the log therefore means a verified
+  employee acted, without revealing which one.
+- With `CG_REQUIRE_BOTH_SIDES=1` the site has no moderation at all unless
+  both an agent-side and a community-side key are configured.
+- Purging erases the text from the live database file and its journal.
 
 ## What the software does not do
-- It does not verify who holds a key, stop moderators sharing one, or
-  require that both sides be represented. The two-sided team above is an
-  operating commitment that the people running a site must keep.
-- It does not purge automatically. Removed content stays in the database
-  until a moderator purges it.
+- It cannot verify who holds a community-side key or stop moderators
+  sharing keys.
+- It does not require both sides to agree on an individual action; either
+  side's moderator can act alone, and the log shows which did.
+- It does not purge automatically, and a purge cannot reach backups or
+  other copies of the database made earlier.

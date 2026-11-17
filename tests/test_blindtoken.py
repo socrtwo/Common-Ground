@@ -144,11 +144,36 @@ def test_blinded_request_reveals_nothing_about_token(pubkey):
     assert holder.prepare()[1] != blinded
 
 
-def test_fdh_is_deterministic_and_in_range(pubkey):
+def test_token_is_a_standard_pss_signature(pubkey, mint):
+    """Independent check with the cryptography library, bypassing this module."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    token = mint()
     n = int(pubkey["n"], 16)
-    a = blindtoken._fdh(b"x", n)
-    assert a == blindtoken._fdh(b"x", n) != blindtoken._fdh(b"y", n)
-    assert 0 <= a < n
+    assert len(token["sig"]) == 2 * ((n.bit_length() + 7) // 8)
+    rsa.RSAPublicNumbers(65537, n).public_key().verify(
+        bytes.fromhex(token["sig"]), blindtoken._token_message(token["epoch"], token["nonce"]),
+        padding.PSS(mgf=padding.MGF1(hashes.SHA384()), salt_length=48), hashes.SHA384())
+
+
+def test_pss_encoding_matches_cryptography_library():
+    """Sign our own EMSA-PSS encoding with a raw private-key operation and
+    have the library accept it, across awkward modulus sizes."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    for bits in (2048, 2050, 2055, 2056):
+        priv = rsa.generate_private_key(public_exponent=65537, key_size=bits).private_numbers()
+        n = priv.public_numbers.n
+        for msg in (b"", b"abc", b"x" * 1000):
+            em = blindtoken._emsa_pss_encode(msg, n.bit_length() - 1, b"\x07" * 48)
+            # Key generation may return a modulus a bit shorter than asked.
+            k = (n.bit_length() + 7) // 8
+            sig = pow(int.from_bytes(em, "big"), priv.d, n).to_bytes(k, "big")
+            assert blindtoken._pss_verify(n, 65537, msg, sig)
+            assert not blindtoken._pss_verify(n, 65537, msg + b"!", sig)
+
+
+def test_same_token_request_is_never_blinded_the_same_way(pubkey):
+    assert len({Holder(pubkey).prepare()[1] for _ in range(5)}) == 5
 
 
 @pytest.mark.parametrize("mutate", [

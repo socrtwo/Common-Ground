@@ -23,9 +23,11 @@ An anonymous dialogue forum between verified ICE employees and the public.
   operated by U.S. Immigration and Customs Enforcement or the Department of
   Homeland Security. The verification design is a proposal; this repository
   ships no agency issuer and no agency key.
-- The credential code is textbook blind RSA written for clarity. It has not
-  been audited. A real deployment must replace it with an audited RFC 9474
-  implementation (see [docs/VERIFICATION.md](docs/VERIFICATION.md)).
+- The credential code follows RFC 9474 (blind RSA signatures), and the site
+  verifies tokens with the audited `cryptography` library. The issuing and
+  blinding steps are still hand-written Python that nobody has independently
+  audited; a real deployment must replace them (see
+  [docs/VERIFICATION.md](docs/VERIFICATION.md)).
 - See [Known limitations](#known-limitations) before relying on any property
   described here.
 
@@ -85,7 +87,8 @@ Set through environment variables.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ADMIN_KEY` | unset | Single moderator password, shown in the mod log as `moderator`. Must be at least 16 characters. |
-| `CG_MOD_KEYS` | unset | One key per moderator: `label=key` entries separated by commas or newlines, e.g. `agent-side=...,community=...`. Each key must be at least 16 characters. The label is public (it appears in the mod log), so use a role, not a name. |
+| `CG_MOD_KEYS` | unset | One key per moderator: `label@side=key` entries separated by commas or newlines, with side `agent` or `community`, e.g. `a1@agent=...,c1@community=...`. The side may be omitted. Each key must be at least 16 characters. Label and side are public (they appear in the mod log), so use a role, not a name. An agent-side key works only from an account with a valid agent badge. |
+| `CG_REQUIRE_BOTH_SIDES` | unset | Set to `1` to disable moderation entirely unless at least one agent-side and one community-side key are configured. Keys with no side, including `ADMIN_KEY`, are then ignored. |
 | `CG_DB` | `commonground.db` | SQLite database path. |
 | `CG_KEYRING` | `keyring.json` | Pinned issuer public keys, `{epoch: key}`. Re-read on each request, so keys rotate without a restart. |
 | `CG_COOKIE_SECURE` | `1` under WSGI, `0` for `python3 app.py` | Send cookies with the `Secure` flag. Leave on for anything served over HTTPS. |
@@ -151,19 +154,23 @@ docs/VERIFICATION.md      Credential protocol, properties, governance
 
 ## Known limitations
 
-- **Unaudited cryptography**, as stated above.
+- **Partly unaudited cryptography**, as stated above. The RFC's official
+  test vectors have not been run against this code; it is cross-checked
+  against the `cryptography` library's verifier instead.
 - **Weak Sybil resistance.** Accounts are free and anonymous by design. The
   per-account post interval, new-account delay, and site-wide join cap slow
   abuse but do not stop a determined attacker, and the join cap can itself be
   exhausted to block sign-ups for a while.
-- **Moderator identity is only as good as key handling.** With `CG_MOD_KEYS`
-  the mod log names the key that acted, but nothing stops moderators sharing
-  a key, and nothing in the code requires that both sides be represented.
-  The policy's two-sided team remains an operating commitment.
-- **Removed content stays in the database** until a moderator purges it.
-  Removal hides a post so it can be restored; purging erases the text for
-  good. SQLite may keep erased bytes in free pages until the file is
-  vacuumed, and backups keep whatever they captured.
+- **Moderator identity is only partly checked.** An agent-side key is
+  honoured only from an account with a valid badge, so "agent side" in the
+  log means a verified employee. Nothing can check who holds a
+  community-side key, and nothing stops people sharing keys.
+  `CG_REQUIRE_BOTH_SIDES=1` guarantees both sides hold a key, not that both
+  take part in any given decision.
+- **Purging cannot reach backups.** Removal hides a post so it can be
+  restored; purging erases the text, truncates SQLite's journal and vacuums
+  the file. Copies made earlier (backups, snapshots) keep the text, and
+  flash storage may retain old blocks below the filesystem.
 - **Timing correlation.** If the issuer and the platform pool their logs,
   issuance and redemption times can still narrow down who holds a badge;
   see the mitigations in [docs/VERIFICATION.md](docs/VERIFICATION.md).

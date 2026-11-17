@@ -50,7 +50,8 @@ an employee union. Code is identical; only the published key changes.
 ## How the prototype implements it (`src/blindtoken.py`)
 
 ### Formats
-Integers are lowercase hex strings with no `0x` prefix.
+Integers and signatures are lowercase hex strings with no `0x` prefix. A
+signature is always exactly as long as the modulus.
 
     public key   {"epoch": "2026-Q4", "n": "<hex>", "e": 65537, "expires": 1798761600}
     token        {"epoch": "2026-Q4", "nonce": "<64 hex chars>", "sig": "<hex>"}
@@ -60,8 +61,12 @@ Integers are lowercase hex strings with no `0x` prefix.
 `A-Z a-z 0-9 . _ -`, starting with a letter or digit.
 
 The signed message is `"common-ground/token/v1" || 0x00 || epoch || 0x00 ||
-nonce`, hashed onto the modulus with a SHAKE-256 full-domain hash. The
-nullifier is SHA-256 over the same message under a separate domain tag.
+nonce`. The scheme is RSABSSA-SHA384-PSS-Deterministic from RFC 9474, the
+variant Privacy Pass uses for publicly verifiable tokens: SHA-384, MGF1 with
+SHA-384, a 48-byte salt, and no message prefix (the 256-bit nonce supplies
+the entropy). A finished token is therefore an ordinary RSASSA-PSS
+signature. The nullifier is SHA-256 over the same message under a separate
+domain tag.
 
 ### Issuer
 - Private keys and the quota secret are created owner-readable only (0600)
@@ -75,13 +80,17 @@ nullifier is SHA-256 over the same message under a separate domain tag.
   checked before release.
 
 ### Holder
-- Verifies the unblinded signature before accepting it, so a faulty or
-  dishonest issuer is caught before a token is spent.
+- Encodes and blinds the message as RFC 9474 specifies (hand-written).
+- Verifies the unblinded signature with the `cryptography` library before
+  accepting it, so a faulty or dishonest issuer is caught before a token is
+  spent.
 
 ### Verifier (the platform)
-- Accepts only well-formed tokens: exact nonce length, `0 < sig < n`,
-  exponent 65537, modulus of at least 2048 bits. Malformed input is
-  rejected, never an error.
+- Verifies the signature with the `cryptography` library's RSASSA-PSS
+  implementation, not with code in this repository.
+- Accepts only well-formed tokens: exact nonce length, signature exactly
+  modulus-length and below `n`, exponent 65537, modulus of at least 2048
+  bits. Malformed input is rejected, never an error.
 - Rejects tokens for unknown or expired epochs.
 - Records the nullifier in the same database transaction that grants the
   badge.
@@ -104,7 +113,8 @@ nullifier is SHA-256 over the same message under a separate domain tag.
 
 | Area | Prototype | Production requirement |
 | --- | --- | --- |
-| Signature scheme | Textbook blind RSA with a full-domain hash | RFC 9474 RSABSSA from an audited library |
+| Signature scheme | RFC 9474 RSABSSA-SHA384-PSS-Deterministic; verification by the `cryptography` library, encoding, blinding and signing hand-written | The same scheme, entirely from an audited library |
+| Conformance | Cross-checked against the `cryptography` library's PSS verifier; RFC 9474 test vectors not yet run | RFC test vectors in CI |
 | Issuance protocol | Python method calls | Privacy Pass issuance, RFC 9576 / RFC 9578 |
 | Arithmetic | Python integers (not constant-time) | Constant-time implementation, keys in an HSM |
 | Issuer authentication | A caller-supplied employee ID | Agency PIV / SSO in front of the issuer |
