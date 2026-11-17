@@ -1,0 +1,41 @@
+{# Import "with context": these use user, admin, rules and csrf_field. #}
+
+{% macro badge(flag) %}{% if flag %} <span class="badge">Verified ICE employee</span>{% endif %}{% endmacro %}
+
+{% macro rule_select() -%}
+<select name="rule" required aria-label="Rule broken">
+  {% for short, _ in rules %}<option value="{{ loop.index }}">Rule {{ loop.index }}: {{ short }}</option>{% endfor %}
+</select>
+{%- endmacro %}
+
+{# show_removed: moderators reviewing a removed post still need to read it. #}
+{% macro render_post(p, show_removed=false) %}
+<article class="post" id="p{{ p.id }}">
+  <div class="meta">{{ p.handle }}{{ badge(p.agent) }} · {{ p.created|ts }}
+    {%- if admin %} · <a href="{{ url_for('forum.admin_post', pid=p.id) }}">moderate</a>{% endif %}</div>
+  {% if p.hidden and not show_removed %}
+    <p class="removed">[removed by moderator — see mod log]</p>
+  {% else %}
+    {% if p.hidden %}<p class="removed">[removed — visible to moderators only]</p>{% endif %}
+    <p class="body">{{ p.body }}</p>
+  {% endif %}
+  {% if user and not p.hidden %}
+  <details class="report">
+    <summary>Report</summary>
+    <form method="post" action="{{ url_for('forum.report', pid=p.id) }}">{{ csrf_field }}
+      {{ rule_select() }} <button>Send report</button>
+    </form>
+  </details>
+  {% endif %}
+</article>
+{% endmacro %}
+
+{% macro pager(endpoint, page, has_next) %}
+{% if page > 1 or has_next %}
+<nav class="pager" aria-label="Pages">
+  {% if page > 1 %}<a href="{{ url_for(endpoint, page=page - 1) }}">← Newer</a>{% endif %}
+  <span>Page {{ page }}</span>
+  {% if has_next %}<a href="{{ url_for(endpoint, page=page + 1) }}">Older →</a>{% endif %}
+</nav>
+{% endif %}
+{% endmacro %}

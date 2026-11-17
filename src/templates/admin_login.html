@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Admin login</h1>
+{% if enabled %}
+<form method="post" action="{{ url_for('forum.admin_login') }}">{{ csrf_field }}
+  <input type="password" name="key" aria-label="Admin key" autocomplete="off" required>
+  <button>Enter</button>
+</form>
+{% else %}
+<p>The admin panel is disabled: the server was started without an ADMIN_KEY of at
+least {{ config.MIN_ADMIN_KEY_LEN }} characters.</p>
+{% endif %}
+{% endblock %}

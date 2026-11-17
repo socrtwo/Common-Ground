@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>You are {{ handle }}</h1>
+<p>Your secret key is shown <b>once</b>. Save it now: it is the only way to log in
+on another device or after logging out, and it cannot be recovered.</p>
+<p><code class="secret">{{ secret }}</code></p>
+{% if wait %}<p class="meta">New accounts can post after {{ wait }} seconds.</p>{% endif %}
+<p><a href="{{ url_for('forum.index') }}">Continue</a></p>
+{% endblock %}

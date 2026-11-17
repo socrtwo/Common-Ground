@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% from "_macros.html" import render_post with context %}
+{% block content %}
+<h1>Report queue ({{ queue|length }})</h1>
+{% for p in queue %}
+{{ render_post(p) }}
+<p class="meta">{{ p.n_reports }} open report{{ '' if p.n_reports == 1 else 's' }} ·
+rule{{ '' if ',' not in p.rules_cited else 's' }} cited: {{ p.rules_cited|replace(',', ', ') }} ·
+<a href="{{ url_for('forum.thread', tid=p.thread_id) }}#p{{ p.id }}">in context</a></p>
+{% else %}
+<p>Queue empty.</p>
+{% endfor %}
+{% endblock %}

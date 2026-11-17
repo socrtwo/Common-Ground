@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pager with context %}
+{% block content %}
+<h1>Public moderation log</h1>
+{% for r in rows %}
+<div class="meta">{{ r.created|ts }} — <b>{{ r.action }}</b> {{ r.target }}: {{ r.reason }}</div>
+{% else %}
+<p>No actions yet.</p>
+{% endfor %}
+{{ pager('forum.modlog', page, has_next) }}
+{% endblock %}

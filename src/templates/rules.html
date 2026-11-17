@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Rules</h1>
+<ol>{% for _, text in rules %}<li>{{ text }}</li>{% endfor %}</ol>
+<p>Moderators remove posts that break these rules and may mute accounts for a set time.
+Every action is listed publicly in the <a href="{{ url_for('forum.modlog') }}">mod log</a>.
+Disagreement alone is never grounds for removal.</p>
+{% endblock %}

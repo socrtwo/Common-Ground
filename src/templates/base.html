@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Common Ground{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <a class="brand" href="{{ url_for('forum.index') }}">Common Ground</a>
+  <a href="{{ url_for('forum.rules') }}">Rules</a>
+  <a href="{{ url_for('forum.modlog') }}">Mod log</a>
+  {% if user %}
+    <span>{{ user.handle }}{% if user_is_agent %} <span class="badge">Verified ICE employee</span>{% endif %}</span>
+    {% if not user_is_agent %}<a href="{{ url_for('forum.verify') }}">Agent verification</a>{% endif %}
+    <form class="inline" method="post" action="{{ url_for('forum.logout') }}">{{ csrf_field }}<button>Log out</button></form>
+  {% else %}
+    <form class="inline" method="post" action="{{ url_for('forum.join') }}">{{ csrf_field }}<button>Join anonymously</button></form>
+    <a href="{{ url_for('forum.login') }}">Log in</a>
+  {% endif %}
+  {% if admin %}
+    <a href="{{ url_for('forum.admin') }}">Admin</a>
+    <form class="inline" method="post" action="{{ url_for('forum.admin_logout') }}">{{ csrf_field }}<button>Admin log out</button></form>
+  {% endif %}
+</header>
+<main>
+{% if msg or notice %}<p class="msg" role="status">{{ msg or notice }}</p>{% endif %}
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>
