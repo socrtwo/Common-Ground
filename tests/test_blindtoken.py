@@ -83,7 +83,7 @@ def test_expired_key_rejected(tmp_path, pubkey, mint):
 def test_quota_enforced_per_employee_and_epoch(tmp_path):
     iss = Issuer(str(tmp_path / "iss"), tokens_per_epoch=2)
     pub = iss.new_epoch_key("e1", key_size=2048)
-    iss.new_epoch_key("e2", key_size=2048)
+    pub2 = iss.new_epoch_key("e2", key_size=2048)
     holder = Holder(pub)
     blinded = lambda: holder.prepare()[1]             # noqa: E731
     iss.sign_blinded("alice", "e1", blinded())
@@ -91,7 +91,9 @@ def test_quota_enforced_per_employee_and_epoch(tmp_path):
     with pytest.raises(QuotaExceeded):
         iss.sign_blinded("alice", "e1", blinded())
     iss.sign_blinded("bob", "e1", blinded())          # other employee unaffected
-    iss.sign_blinded("alice", "e2", blinded())        # other epoch unaffected
+    # Other epoch unaffected. A request must be blinded for that epoch's own
+    # modulus, or it can fall outside the valid range.
+    iss.sign_blinded("alice", "e2", Holder(pub2).prepare()[1])
     iss.close()
 
 

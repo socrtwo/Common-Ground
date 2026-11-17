@@ -44,7 +44,8 @@ ADMIN_KEY=$(python3 -c "import secrets;print(secrets.token_urlsafe(16))") python
 ```
 
 Open <http://127.0.0.1:5000>. To use the admin panel at `/admin`, choose the
-`ADMIN_KEY` yourself (16 characters or more) so you know what to type.
+`ADMIN_KEY` yourself (16 characters or more) so you know what to type. The
+panel is disabled when neither `ADMIN_KEY` nor `CG_MOD_KEYS` is set.
 
 ### Termux (Android)
 
@@ -54,6 +55,9 @@ git clone https://github.com/socrtwo/Common-Ground.git
 cd Common-Ground && pip install flask
 cd src && ADMIN_KEY=choose-16-or-more-chars python3 app.py
 ```
+
+`scripts/termux-install.sh` does the same and then runs the protocol
+walkthrough as a self-test.
 
 `python-cryptography` is installed from the Termux package so that pip does
 not try to compile it on the device.
@@ -80,7 +84,8 @@ Set through environment variables.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ADMIN_KEY` | unset | Moderator password. The admin panel is disabled unless this is at least 16 characters. |
+| `ADMIN_KEY` | unset | Single moderator password, shown in the mod log as `moderator`. Must be at least 16 characters. |
+| `CG_MOD_KEYS` | unset | One key per moderator: `label=key` entries separated by commas or newlines, e.g. `agent-side=...,community=...`. Each key must be at least 16 characters. The label is public (it appears in the mod log), so use a role, not a name. |
 | `CG_DB` | `commonground.db` | SQLite database path. |
 | `CG_KEYRING` | `keyring.json` | Pinned issuer public keys, `{epoch: key}`. Re-read on each request, so keys rotate without a restart. |
 | `CG_COOKIE_SECURE` | `1` under WSGI, `0` for `python3 app.py` | Send cookies with the `Secure` flag. Leave on for anything served over HTTPS. |
@@ -120,6 +125,7 @@ ruff check .    # lint, including the flake8-bandit security rules
 
 ```
 src/app.py                Flask application (routes, moderation, rate limits)
+scripts/termux-install.sh One-step install for Termux on Android
 src/blindtoken.py         Issuer / Holder / Verifier for the blind-signed tokens
 src/make_demo_token.py    TESTING ONLY stand-in for the agency issuer
 src/demo_verification.py  Console walkthrough of the protocol
@@ -150,18 +156,20 @@ docs/VERIFICATION.md      Credential protocol, properties, governance
   per-account post interval, new-account delay, and site-wide join cap slow
   abuse but do not stop a determined attacker, and the join cap can itself be
   exhausted to block sign-ups for a while.
-- **One shared moderator key.** The mod log records what was done and under
-  which rule, but not which moderator did it. The policy's two-sided
-  moderation team is an operating practice, not something the code enforces.
-- **Removed content stays in the database** (hidden from the public) so that
-  a wrongly removed post can be restored. Operators should purge doxxing
-  material out of band.
+- **Moderator identity is only as good as key handling.** With `CG_MOD_KEYS`
+  the mod log names the key that acted, but nothing stops moderators sharing
+  a key, and nothing in the code requires that both sides be represented.
+  The policy's two-sided team remains an operating commitment.
+- **Removed content stays in the database** until a moderator purges it.
+  Removal hides a post so it can be restored; purging erases the text for
+  good. SQLite may keep erased bytes in free pages until the file is
+  vacuumed, and backups keep whatever they captured.
 - **Timing correlation.** If the issuer and the platform pool their logs,
   issuance and redemption times can still narrow down who holds a badge;
   see the mitigations in [docs/VERIFICATION.md](docs/VERIFICATION.md).
 - **SQLite and a single process.** Fine for a prototype; not built for load.
-- **No migrations.** The app refuses to open a database written by a
-  different schema version rather than guess.
+- **Minimal migrations.** Schema 2 databases are upgraded in place on
+  start-up. Anything older is refused rather than guessed at.
 
 ## Contributing
 

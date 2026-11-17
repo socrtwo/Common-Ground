@@ -13,7 +13,9 @@
 <article class="post" id="p{{ p.id }}">
   <div class="meta">{{ p.handle }}{{ badge(p.agent) }} · {{ p.created|ts }}
     {%- if admin %} · <a href="{{ url_for('forum.admin_post', pid=p.id) }}">moderate</a>{% endif %}</div>
-  {% if p.hidden and not show_removed %}
+  {% if p.purged %}
+    <p class="removed">[removed by moderator and permanently erased — see mod log]</p>
+  {% elif p.hidden and not show_removed %}
     <p class="removed">[removed by moderator — see mod log]</p>
   {% else %}
     {% if p.hidden %}<p class="removed">[removed — visible to moderators only]</p>{% endif %}
@@ -30,12 +32,13 @@
 </article>
 {% endmacro %}
 
-{% macro pager(endpoint, page, has_next) %}
+{# Extra keyword arguments (e.g. tid=...) are passed through to url_for. #}
+{% macro pager(endpoint, page, has_next, prev_label='Newer', next_label='Older') %}
 {% if page > 1 or has_next %}
 <nav class="pager" aria-label="Pages">
-  {% if page > 1 %}<a href="{{ url_for(endpoint, page=page - 1) }}">← Newer</a>{% endif %}
+  {% if page > 1 %}<a href="{{ url_for(endpoint, page=(page - 1 if page > 2 else none), **kwargs) }}">← {{ prev_label }}</a>{% endif %}
   <span>Page {{ page }}</span>
-  {% if has_next %}<a href="{{ url_for(endpoint, page=page + 1) }}">Older →</a>{% endif %}
+  {% if has_next %}<a href="{{ url_for(endpoint, page=page + 1, **kwargs) }}">{{ next_label }} →</a>{% endif %}
 </nav>
 {% endif %}
 {% endmacro %}

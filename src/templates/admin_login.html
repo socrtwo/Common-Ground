@@ -7,7 +7,7 @@
   <button>Enter</button>
 </form>
 {% else %}
-<p>The admin panel is disabled: the server was started without an ADMIN_KEY of at
-least {{ config.MIN_ADMIN_KEY_LEN }} characters.</p>
+<p>The admin panel is disabled: the server was started without a moderator key
+(ADMIN_KEY or CG_MOD_KEYS) of at least {{ config.MIN_ADMIN_KEY_LEN }} characters.</p>
 {% endif %}
 {% endblock %}

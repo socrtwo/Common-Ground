@@ -382,3 +382,126 @@ def test_no_ip_address_is_stored(application, member, browser):
     dump = "\n".join(conn.iterdump())
     conn.close()
     assert "203.0.113" not in dump
+
+
+# ------------------------------------------------------- moderator identities
+def team_app(tmp_path, keyring_path, mod_keys, admin_key=None):
+    return forum.create_app({"TESTING": True, "DB": str(tmp_path / "team.db"),
+                             "KEYRING": str(keyring_path), "ADMIN_KEY": admin_key,
+                             "MOD_KEYS": mod_keys, "COOKIE_SECURE": False,
+                             "NEW_ACCOUNT_WAIT": 0})
+
+
+def client_for(application):
+    client = application.test_client()
+    client.get("/")
+    csrf = client.get_cookie("cg_csrf").value
+    return client, (lambda path, **data: client.post(path, data={**data, "csrf": csrf}))
+
+
+def test_each_moderator_key_is_named_in_the_public_log(tmp_path, keyring_path, clock):
+    keys = "agent-side=agent-key-0123456789, community=community-key-012345"
+    application = team_app(tmp_path, keyring_path, keys)
+    member, post = client_for(application)
+    post("/join")
+    post("/new", title="One", body="first")
+    clock.advance(60)
+    post("/t/1", body="second")
+
+    for key, pid in (("agent-key-0123456789", 1), ("community-key-012345", 2)):
+        mod, mod_post = client_for(application)
+        assert mod_post("/admin/login", key=key).status_code == 302
+        assert mod_post(f"/admin/post/{pid}", action="remove", rule="3").status_code == 302
+    assert query(application, "SELECT moderator FROM modlog ORDER BY id") == [
+        ("agent-side",), ("community",)]
+    log = member.get("/modlog").data
+    assert b"(by agent-side)" in log and b"(by community)" in log
+
+
+def test_moderator_session_cannot_be_relabelled(tmp_path, keyring_path):
+    keys = "alpha=alpha-key-0123456789ab,beta=beta-key-0123456789abc"
+    application = team_app(tmp_path, keyring_path, keys)
+    mod, post = client_for(application)
+    post("/admin/login", key="alpha-key-0123456789ab")
+    label, _, mac = mod.get_cookie("cg_admin").value.partition(":")
+    assert label == "alpha" and b"Admin (alpha)" in mod.get("/").data
+    mod.set_cookie("cg_admin", f"beta:{mac}")
+    assert b"Admin login" in mod.get("/admin").data
+    mod.set_cookie("cg_admin", f"nobody:{mac}")
+    assert b"Admin login" in mod.get("/admin").data
+
+
+def test_bad_moderator_entries_are_ignored(tmp_path, keyring_path):
+    keys = "ok=ok-key-0123456789abcdef\nweak=short, bad label=key-0123456789abcdef, nokey"
+    application = team_app(tmp_path, keyring_path, keys, admin_key="legacy-key-0123456789")
+    with application.test_request_context("/"):
+        assert sorted(forum.moderators()) == ["moderator", "ok"]
+    _, post = client_for(application)
+    assert post("/admin/login", key="short").status_code == 403
+    assert post("/admin/login", key="legacy-key-0123456789").status_code == 302
+
+
+# --------------------------------------------------------------------- purge
+def test_purge_erases_content_permanently(application, member, browser, clock):
+    start_thread(member, "Someone's home address", "their street and number")
+    mod = browser()
+    mod.admin_login()
+    mod.post("/admin/post/1", {"action": "purge"})                 # not removed yet: no-op
+    mod.post("/admin/post/1", {"action": "purge_title"})
+    assert query(application, "SELECT body, purged FROM posts") == [("their street and number", 0)]
+
+    mod.post("/admin/post/1", {"action": "remove", "rule": "1"})
+    mod.post("/admin/post/1", {"action": "hide_title", "rule": "1"})
+    mod.post("/admin/post/1", {"action": "purge"})
+    mod.post("/admin/post/1", {"action": "purge_title"})
+    assert query(application, "SELECT body, purged FROM posts") == [("", 1)]
+    assert query(application, "SELECT title, title_hidden FROM threads") == [("", 1)]
+
+    mod.post("/admin/post/1", {"action": "restore"})               # nothing left to restore
+    mod.post("/admin/post/1", {"action": "restore_title"})
+    assert query(application, "SELECT hidden FROM posts") == [(1,)]
+    assert query(application, "SELECT title_hidden FROM threads") == [(1,)]
+    for page in (member.get("/t/1").data, mod.get("/admin/post/1").data, member.get("/").data):
+        assert b"street" not in page and b"home address" not in page
+    assert b"permanently erased" in member.get("/t/1").data
+    actions = [r[0] for r in query(application, "SELECT action FROM modlog ORDER BY id")]
+    assert actions == ["removed post", "removed title", "purged post content", "purged title"]
+
+
+# ---------------------------------------------------------- thread pagination
+def test_thread_pagination_and_reply_lands_on_last_page(application, member, clock):
+    application.config["PAGE_SIZE"] = 2
+    start_thread(member, "Long thread", "post 0")
+    for i in range(1, 4):
+        clock.advance(60)
+        resp = member.post("/t/1", {"body": f"post {i}"})
+    assert resp.headers["Location"] == "/t/1?page=2#end"
+    first, second = member.get("/t/1").data, member.get("/t/1?page=2").data
+    assert b"post 0" in first and b"post 1" in first and b"post 2" not in first
+    assert b"post 2" in second and b"post 3" in second and b"post 0" not in second
+    assert b'href="/t/1?page=2"' in first and b'href="/t/1"' in second
+    assert b"No posts on this page" in member.get("/t/1?page=9").data
+    clock.advance(60)
+    member.post("/t/1", {"body": "post 4"})
+    assert b"post 4" in member.get("/t/1?page=3").data
+
+
+# ----------------------------------------------------------------- migration
+def test_schema_2_database_is_migrated_in_place(tmp_path, keyring_path):
+    path = tmp_path / "v2.db"
+    conn = sqlite3.connect(path)
+    v2 = forum.SCHEMA.replace(",\n  purged INTEGER NOT NULL DEFAULT 0)", ")").replace(
+        ",\n  moderator TEXT NOT NULL DEFAULT '')", ")")
+    assert "purged INTEGER" not in v2 and "moderator TEXT" not in v2
+    conn.executescript(v2)
+    conn.execute("INSERT INTO modlog(action,target,reason,created) "
+                 "VALUES('removed post','#1','r',1)")
+    conn.execute("PRAGMA user_version=2")
+    conn.commit()
+    conn.close()
+    application = forum.create_app({"TESTING": True, "DB": str(path),
+                                    "KEYRING": str(keyring_path), "COOKIE_SECURE": False})
+    assert query(application, "PRAGMA user_version") == [(3,)]
+    assert query(application, "SELECT action, moderator FROM modlog") == [("removed post", "")]
+    assert query(application, "SELECT COUNT(purged) FROM posts") == [(0,)]
+    assert b"removed post" in application.test_client().get("/modlog").data

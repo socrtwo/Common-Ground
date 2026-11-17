@@ -2,6 +2,7 @@
 Common Ground - anonymous dialogue between verified ICE employees and the public.
 
 Run:   ADMIN_KEY=<16+ chars> python3 app.py      ->  http://127.0.0.1:5000
+       (or CG_MOD_KEYS="label=key,label=key" for one key per moderator)
 WSGI:  gunicorn 'app:create_app()'
 
 - No email, phone, or IP is stored. Accounts are a random handle + secret key.
@@ -16,6 +17,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -35,7 +37,13 @@ from markupsafe import Markup
 
 from blindtoken import Verifier, key_is_active, load_keyring
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+# Statements that bring a database from the keyed version to the next one.
+MIGRATIONS = {
+    2: ["ALTER TABLE posts ADD COLUMN purged INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE modlog ADD COLUMN moderator TEXT NOT NULL DEFAULT ''"],
+}
+MOD_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,23}")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY,
@@ -61,7 +69,8 @@ CREATE TABLE IF NOT EXISTS posts(
   body TEXT NOT NULL,
   agent INTEGER NOT NULL DEFAULT 0,         -- author's badge was valid when posted
   created INTEGER NOT NULL,
-  hidden INTEGER NOT NULL DEFAULT 0);
+  hidden INTEGER NOT NULL DEFAULT 0,
+  purged INTEGER NOT NULL DEFAULT 0);        -- body erased; cannot be restored
 CREATE TABLE IF NOT EXISTS reports(
   id INTEGER PRIMARY KEY,
   post_id INTEGER NOT NULL REFERENCES posts(id),
@@ -75,7 +84,8 @@ CREATE TABLE IF NOT EXISTS modlog(
   action TEXT NOT NULL,
   target TEXT NOT NULL,
   reason TEXT NOT NULL,
-  created INTEGER NOT NULL);
+  created INTEGER NOT NULL,
+  moderator TEXT NOT NULL DEFAULT '');      -- public label of the acting moderator
 CREATE INDEX IF NOT EXISTS users_created ON users(created);
 CREATE INDEX IF NOT EXISTS threads_bumped ON threads(bumped);
 CREATE INDEX IF NOT EXISTS posts_thread ON posts(thread_id, id);
@@ -139,10 +149,17 @@ def init_db(path: str) -> None:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         populated = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
+        while populated and version in MIGRATIONS:
+            for statement in MIGRATIONS[version]:
+                conn.execute(statement)
+            version += 1
+            conn.execute(f"PRAGMA user_version={version}")
+            conn.commit()
         if populated and version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"{path} uses database schema {version}; this code needs "
-                f"{SCHEMA_VERSION}. Move the old file aside (or migrate it) and restart.")
+                f"{SCHEMA_VERSION} and has no migration from it. Move the old "
+                f"file aside and restart.")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         conn.execute(Verifier.SCHEMA)
@@ -218,20 +235,58 @@ def badge_active(user) -> bool:
     return pk is not None and key_is_active(pk)
 
 
-def admin_token() -> str | None:
-    """Value of the admin session cookie, or None if admin access is off.
-    Derived from ADMIN_KEY so the key itself is never stored in a browser."""
-    key = cfg("ADMIN_KEY")
-    if not key or len(key) < cfg("MIN_ADMIN_KEY_LEN"):
-        return None
-    return hmac.new(key.encode(), b"common-ground/admin-session/v1", hashlib.sha256).hexdigest()
+def parse_mod_keys(text: str | None) -> tuple[dict, list]:
+    """Parse CG_MOD_KEYS: 'label=key' entries separated by commas or newlines.
+    Returns ({label: key}, [descriptions of rejected entries])."""
+    keys, bad = {}, []
+    for entry in re.split(r"[,\n]", text or ""):
+        entry = entry.strip()
+        if not entry:
+            continue
+        label, sep, key = entry.partition("=")
+        label = label.strip()
+        if not sep or not MOD_LABEL_RE.fullmatch(label):
+            bad.append("an entry without a valid label")
+        elif label in keys:
+            bad.append(f"duplicate label {label!r}")
+        else:
+            keys[label] = key.strip()
+    return keys, bad
+
+
+def moderators() -> dict:
+    """{public label: key} for every usable moderator key. ADMIN_KEY is the
+    single-key shorthand and logs as 'moderator'; CG_MOD_KEYS gives each
+    moderator their own key so the public log shows who acted."""
+    if "moderators" not in g:
+        keys, _ = parse_mod_keys(cfg("MOD_KEYS"))
+        if cfg("ADMIN_KEY"):
+            keys.setdefault("moderator", cfg("ADMIN_KEY"))
+        g.moderators = {label: key for label, key in keys.items()
+                        if len(key) >= cfg("MIN_ADMIN_KEY_LEN")}
+    return g.moderators
+
+
+def admin_token(label: str) -> str:
+    """Admin session cookie for one moderator. Derived from the key so the
+    key itself is never stored in a browser."""
+    mac = hmac.new(moderators()[label].encode(),
+                   b"common-ground/admin-session/v2\x00" + label.encode(), hashlib.sha256)
+    return f"{label}:{mac.hexdigest()}"
+
+
+def current_moderator() -> str | None:
+    """Public label of the moderator making this request, if any."""
+    if "moderator" not in g:
+        cookie = request.cookies.get("cg_admin", "")
+        label = cookie.partition(":")[0]
+        g.moderator = (label if label in moderators() and same(cookie, admin_token(label))
+                       else None)
+    return g.moderator
 
 
 def is_admin() -> bool:
-    if "admin" not in g:
-        token = admin_token()
-        g.admin = token is not None and same(request.cookies.get("cg_admin", ""), token)
-    return g.admin
+    return current_moderator() is not None
 
 
 def require_admin() -> None:
@@ -265,8 +320,9 @@ def rule_label(rule: int) -> str:
 
 def log_mod(action: str, target: str, reason: str) -> None:
     """Append to the public moderation log (caller commits)."""
-    get_db().execute("INSERT INTO modlog(action,target,reason,created) VALUES(?,?,?,?)",
-                     (action, target, reason, now()))
+    get_db().execute(
+        "INSERT INTO modlog(action,target,reason,created,moderator) VALUES(?,?,?,?,?)",
+        (action, target, reason, now(), current_moderator() or ""))
 
 
 def page_number() -> int:
@@ -312,6 +368,7 @@ def template_context():
         "user": user,
         "user_is_agent": badge_active(user),
         "admin": is_admin(),
+        "moderator": current_moderator(),
         "rules": RULES,
         "notice": NOTICES.get(request.args.get("m", "")),
         "csrf_field": Markup('<input type="hidden" name="csrf" value="{}">').format(
@@ -435,11 +492,21 @@ def thread(tid):
         else:
             insert_post(user, tid, draft)
             db.commit()
-            return redirect(url_for("forum.thread", tid=tid) + "#end")
+            return redirect(url_for("forum.thread", tid=tid, page=last_page(tid)) + "#end")
+    size, page = cfg("PAGE_SIZE"), page_number()
     posts = db.execute(
         """SELECT p.*, u.handle FROM posts p JOIN users u ON u.id=p.user_id
-           WHERE p.thread_id=? ORDER BY p.id""", (tid,)).fetchall()
-    return render_template("thread.html", t=t, posts=posts, msg=msg, draft=draft), status
+           WHERE p.thread_id=? ORDER BY p.id LIMIT ? OFFSET ?""",
+        (tid, size + 1, (page - 1) * size)).fetchall()
+    return render_template("thread.html", t=t, posts=posts[:size], page=page,
+                           has_next=len(posts) > size, msg=msg, draft=draft), status
+
+
+def last_page(tid: int) -> int | None:
+    """Page holding a thread's newest post; None for page 1 keeps URLs short."""
+    n = get_db().execute("SELECT COUNT(*) FROM posts WHERE thread_id=?", (tid,)).fetchone()[0]
+    pages = max(1, -(-n // cfg("PAGE_SIZE")))
+    return pages if pages > 1 else None
 
 
 @bp.post("/join")
@@ -558,7 +625,7 @@ def modlog():
 @bp.get("/admin")
 def admin():
     if not is_admin():
-        return render_template("admin_login.html", enabled=admin_token() is not None)
+        return render_template("admin_login.html", enabled=bool(moderators()))
     queue = get_db().execute(
         """SELECT p.*, u.handle, COUNT(*) AS n_reports,
                   GROUP_CONCAT(DISTINCT r.rule) AS rules_cited
@@ -569,12 +636,16 @@ def admin():
 
 @bp.post("/admin/login")
 def admin_login():
-    token = admin_token()
-    if token is None or not same(request.form.get("key", ""), cfg("ADMIN_KEY")):
-        return render_template("admin_login.html", enabled=token is not None,
+    supplied, label = request.form.get("key", ""), None
+    for candidate, key in moderators().items():      # no early exit: check every key
+        if same(supplied, key) and label is None:
+            label = candidate
+    if label is None:
+        return render_template("admin_login.html", enabled=bool(moderators()),
                                msg="Wrong key."), 403
     # Session cookie: admin access ends when the browser closes.
-    return set_cookie(redirect(url_for("forum.admin")), "cg_admin", token, max_age=None)
+    return set_cookie(redirect(url_for("forum.admin")), "cg_admin", admin_token(label),
+                      max_age=None)
 
 
 @bp.post("/admin/logout")
@@ -631,10 +702,10 @@ def moderate(db, p) -> None:
         elif action == "hide_title" and p["is_opener"] and not p["title_hidden"]:
             db.execute("UPDATE threads SET title_hidden=1 WHERE id=?", (p["thread_id"],))
             log_mod("removed title", f"thread #{p['thread_id']} by {p['handle']}", reason)
-    elif action == "restore" and p["hidden"]:
+    elif action == "restore" and p["hidden"] and not p["purged"]:
         db.execute("UPDATE posts SET hidden=0 WHERE id=?", (pid,))
         log_mod("restored post", target, "Reinstated after review")
-    elif action == "restore_title" and p["is_opener"] and p["title_hidden"]:
+    elif action == "restore_title" and p["is_opener"] and p["title_hidden"] and p["title"]:
         db.execute("UPDATE threads SET title_hidden=0 WHERE id=?", (p["thread_id"],))
         log_mod("restored title", f"thread #{p['thread_id']} by {p['handle']}",
                 "Reinstated after review")
@@ -644,8 +715,17 @@ def moderate(db, p) -> None:
     elif action == "dismiss" and p["n_reports"]:
         db.execute("UPDATE reports SET resolved=1 WHERE post_id=?", (pid,))
         log_mod("dismissed reports", f"on post {target}", "No rule violation found")
+    elif action == "purge" and p["hidden"] and not p["purged"]:
+        # Irreversible: the text is erased, not just hidden. For doxxing and
+        # similar material that must not linger in the database.
+        db.execute("UPDATE posts SET body='', purged=1 WHERE id=?", (pid,))
+        log_mod("purged post content", target, "Erased permanently")
+    elif action == "purge_title" and p["is_opener"] and p["title_hidden"] and p["title"]:
+        db.execute("UPDATE threads SET title='' WHERE id=?", (p["thread_id"],))
+        log_mod("purged title", f"thread #{p['thread_id']} by {p['handle']}",
+                "Erased permanently")
     elif action not in ("remove", "hide_title", "restore", "restore_title",
-                        "unmute", "dismiss"):
+                        "unmute", "dismiss", "purge", "purge_title"):
         abort(400)
 
 
@@ -657,6 +737,7 @@ def create_app(config: dict | None = None) -> Flask:
         DB=os.environ.get("CG_DB", "commonground.db"),
         KEYRING=os.environ.get("CG_KEYRING", "keyring.json"),
         ADMIN_KEY=os.environ.get("ADMIN_KEY"),
+        MOD_KEYS=os.environ.get("CG_MOD_KEYS"),
         # Secure by default; only plain-HTTP local testing should turn it off.
         COOKIE_SECURE=os.environ.get("CG_COOKIE_SECURE", "1") != "0",
     )
@@ -665,12 +746,18 @@ def create_app(config: dict | None = None) -> Flask:
     app.register_blueprint(bp)
     init_db(app.config["DB"])
 
-    key = app.config["ADMIN_KEY"]
-    if not key:
-        app.logger.warning("ADMIN_KEY not set; admin panel disabled.")
-    elif len(key) < app.config["MIN_ADMIN_KEY_LEN"]:
-        app.logger.warning("ADMIN_KEY is shorter than %d characters; admin panel disabled.",
-                           app.config["MIN_ADMIN_KEY_LEN"])
+    keys, bad = parse_mod_keys(app.config["MOD_KEYS"])
+    if app.config["ADMIN_KEY"]:
+        keys.setdefault("moderator", app.config["ADMIN_KEY"])
+    short = sorted(label for label, key in keys.items()
+                   if len(key) < app.config["MIN_ADMIN_KEY_LEN"])
+    for problem in bad:
+        app.logger.warning("CG_MOD_KEYS: ignoring %s.", problem)
+    if short:
+        app.logger.warning("Ignoring moderator key(s) shorter than %d characters: %s.",
+                           app.config["MIN_ADMIN_KEY_LEN"], ", ".join(short))
+    if len(keys) == len(short):
+        app.logger.warning("No usable ADMIN_KEY or CG_MOD_KEYS; admin panel disabled.")
     return app
 
 
