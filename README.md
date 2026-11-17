@@ -134,6 +134,7 @@ src/make_demo_token.py    TESTING ONLY stand-in for the agency issuer
 src/demo_verification.py  Console walkthrough of the protocol
 src/templates/, static/   Pages and stylesheet (no JavaScript)
 tests/                    pytest suite
+docs/index.html           Landing page for GitHub Pages (shows this README)
 docs/MODERATION.md        Rules and moderation principles
 docs/VERIFICATION.md      Credential protocol, properties, governance
 ```
